@@ -1,0 +1,34 @@
+I want a better way of handling email, with decent filtering (i.e. not
+relying on gmail) and a way of accessing it over IMAP without farting
+about with ssh.  Useful features:
+
+-- Replies to messages go in same folder as original message, even
+   when the message gets moved around. i.e. tag conversations rather
+   than messages.
+
+-- Outgoing mail delay.
+
+-- Notifications when an expected reply never appears.
+
+-- Some reasonable text search capability.
+
+Filters which would be worth having:
+
+-- Something to get most [git] and [buildbot] messages out of my
+   inbox.  For git, I only really want to see stuff hitting master in
+   storagecore, so filter out anything for private branches and most
+   other repos.  Maybe have a daily summary of all of the active repos
+   and branches.
+
+-- Some way of finding all commit messages related to particular
+   trees.
+
+-- Jira handling: track the state of tickets and highlight messages
+   related to bugs which have ever been assigned to me.
+
+Plan:
+
+-- Slurp email from all of my accounts using fetchmail.
+-- Initially deliver all messages to a pool area, indexed by message ID.
+
+
