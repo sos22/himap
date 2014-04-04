@@ -1,27 +1,12 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 import Data.List
+import Control.Monad.Writer.Lazy
 
 first :: (a -> b) -> (a, c) -> (b, c)
 first f (x, y) = (f x, y)
 
-type Errorable = Either [String]
+type Errorable = Writer String
 
-instance Functor (Either a) where
-  fmap f (Right x) = Right $ f x
-  fmap _ (Left x) = Left x
-  
-{- Annoyingly, we don't quite satisfy the monad laws, because we want
-to collect all of the errors rather than just the first one.  But we
-might as well have the monad-like ops which do make sense. -}
-joinErrors :: Either a (Either a b) -> Either a b
-joinErrors (Left x) = Left x
-joinErrors (Right (Left x)) = Left x
-joinErrors (Right (Right x)) = Right x
-
-instance Monad (Either a) where
-  return = Right
-  x >>= f = joinErrors $ fmap f x
-  
 stateSequence :: [a] -> [(a, ([a], [a]))]
 stateSequence elems =
   zip elems $ zip (inits elems) (tails $ tail elems)
@@ -41,19 +26,22 @@ findNewlines (x:y) = (Just x, y):(findNewlines y)
 
 lines :: String -> [(String, String)]
 lines s =
-  foldr (\elm acc ->
-          case (elm,acc) of
-            ((Nothing, rest),_) -> ([],rest):acc
-            ((Just c, sss), ((_,rr):ss)) -> ((c:sss), rr):ss)
-  [("", "")]
-  (findNewlines s)
+  let worker :: String -> [(Maybe Char, String)] -> [(String, String)]
+      worker fromPrevNewline remainder =
+        case remainder of
+          [] -> [(fromPrevNewline, [])]
+          ((Nothing, trailer):rest) ->
+            (fromPrevNewline, trailer):(worker "" rest)
+          ((Just c, _):rest) ->
+            worker (fromPrevNewline ++ [c]) rest
+  in worker "" $ findNewlines s
 
 headersBody :: String -> Errorable ([String], String)
 headersBody s =
   let ss = Main.lines s in
   case find (\((x,_),_) -> x == "") (zip ss $ inits ss) of
-    Nothing -> Left ["Message has no body?"]
-    Just ((_blank, body), headers) -> Right (map fst headers, body) 
+    Nothing -> tell "Message has no body?" >> return ([],s)
+    Just ((_blank, body), headers) -> return (map fst headers, body) 
 
 unfoldHeaderLines :: [String] -> [String]
 unfoldHeaderLines what =
@@ -77,35 +65,22 @@ unfoldHeaderLines what =
 parseHeader :: String -> Errorable (String, String)
 parseHeader hdrLine =
   case toSep ':' hdrLine of
-    Nothing -> Left ["No : in header line " ++ hdrLine]
-    Just (a, b) -> Right (a, dropWhile (flip elem " \t") b)
+    Nothing -> tell ("No : in header line " ++ hdrLine) >> return (hdrLine, "")
+    Just (a, b) -> return (a, dropWhile (flip elem " \t") b)
   
-liftErrors :: [Errorable a] -> Errorable [a]
-liftErrors [] = Right []
-liftErrors (a:as) =
-  case (a, liftErrors as) of
-    (Left aErr, Left restErrs) -> Left $ aErr ++ restErrs
-    (Left aErr, Right _) -> Left aErr
-    (Right aRes, Right restRes) -> Right $ aRes:restRes
-    (Right _, Left restErrs) -> Left restErrs
-
-liftErrorsPair1 :: (Errorable a, b) -> Errorable (a, b)
-liftErrorsPair1 (Left err1, _) = Left err1
-liftErrorsPair1 (Right res1, res2) = Right (res1, res2)
-
 parseEmail :: String -> Errorable ([(String, String)], String)
-parseEmail =
-  joinErrors .
-  (fmap $ liftErrorsPair1 . (first $ liftErrors . map parseHeader . unfoldHeaderLines)) .
-  headersBody
-
+parseEmail what =
+  do (headerLines, body) <- headersBody what
+     parsedHeaders <- mapM parseHeader $ unfoldHeaderLines headerLines
+     return (parsedHeaders, body)
+     
 main :: IO ()
 main =
   do print $ {-(map (fst . snd) . (take 5)) $ -}stateSequence $ [1,2,3,4,5]
      print $ toSep 'z' "abcxdefxhij"
      print $ findNewlines "foo\r\n\r\nbar\r\nbazz"
      print $ Main.lines "Hello\r\nGoodbye\r\n\r\nfoo"
-     print $ headersBody "H1\r\nH2\r\nH3\r\n\r\nbody"
+     print $ runWriter $ headersBody "H1\r\nH2\r\nH3\r\n\r\nbody"
      print $ unfoldHeaderLines ["L1", " C1", " C2", "L2", "L3", "L4", " C3"]
-     print $ parseEmail "From: foo\r\n bar\r\n\tbazz\r\nTo: Me\r\n\r\nBody"
+     print $ runWriter $ parseEmail "From: foo\r\n bar\r\n\tbazz\r\nTo: Me\r\n\r\nBody"
 
