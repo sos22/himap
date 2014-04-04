@@ -41,7 +41,6 @@ build-type:          Simple
 -- Constraint on the version of Cabal needed to build this package.
 cabal-version:       >=1.8
 
-
 executable harbinger
   -- .hs or .lhs file containing the Main module.
   main-is: Harbinger.hs
@@ -51,4 +50,7 @@ executable harbinger
   
   -- Other library packages from which modules are imported.
   build-depends:       base ==4.5.*
+
+  ghc-options: -Wall
+
   
