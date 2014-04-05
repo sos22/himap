@@ -1,9 +1,9 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 import Data.List
 import Control.Monad.Writer.Lazy
-
-first :: (a -> b) -> (a, c) -> (b, c)
-first f (x, y) = (f x, y)
+import qualified Data.ByteString.Lazy as BSL
+import Data.Word
+import Data.Char
 
 type Errorable = Writer String
 
@@ -18,37 +18,45 @@ toSep sep elems =
     Just x -> Just $ snd x
 
 {- Nothing represents newlines -}
-findNewlines :: [Char] -> [(Maybe Char, String)]
-findNewlines [] = []
-findNewlines [x] = [(Just x, [])]
-findNewlines ('\r':'\n':x) = (Nothing, x):(findNewlines x)
-findNewlines (x:y) = (Just x, y):(findNewlines y)
+findNewlines :: BSL.ByteString -> [(Maybe Word8, BSL.ByteString)]
+findNewlines bsl =
+  let tl = BSL.tail bsl
+      hd = BSL.head bsl
+      hdtl = BSL.head tl
+      tltl = BSL.tail tl
+  in if BSL.null bsl
+     then []
+     else if BSL.null tl
+          then [(Just hd, BSL.empty)]
+          else if or [BSL.null tltl, hd /= 13, hdtl /= 10]
+               then (Just hd, tl):(findNewlines tl)
+               else (Nothing, tltl):(findNewlines tltl)
 
-lines :: String -> [(String, String)]
+lines :: BSL.ByteString -> [([Word8], BSL.ByteString)]
 lines s =
-  let worker :: String -> [(Maybe Char, String)] -> [(String, String)]
+  let worker :: [Word8] -> [(Maybe Word8, BSL.ByteString)] -> [([Word8], BSL.ByteString)]
       worker fromPrevNewline remainder =
         case remainder of
-          [] -> [(fromPrevNewline, [])]
+          [] -> [(fromPrevNewline, BSL.empty)]
           ((Nothing, trailer):rest) ->
-            (fromPrevNewline, trailer):(worker "" rest)
+            (fromPrevNewline, trailer):(worker [] rest)
           ((Just c, _):rest) ->
             worker (fromPrevNewline ++ [c]) rest
-  in worker "" $ findNewlines s
+  in worker [] $ findNewlines s
 
-headersBody :: String -> Errorable ([String], String)
+headersBody :: BSL.ByteString -> Errorable ([String], BSL.ByteString)
 headersBody s =
   let ss = Main.lines s in
-  case find (\((x,_),_) -> x == "") (zip ss $ inits ss) of
+  case find (\((x,_),_) -> x == []) (zip ss $ inits ss) of
     Nothing -> tell "Message has no body?" >> return ([],s)
-    Just ((_blank, body), headers) -> return (map fst headers, body) 
+    Just ((_blank, body), headers) -> return (map (map (chr . fromInteger . toInteger) . fst) headers, body) 
 
 unfoldHeaderLines :: [String] -> [String]
 unfoldHeaderLines what =
   let isLinearWhiteSpace c = c `elem` " \t"
       worker :: [String] -> (Maybe String, [String])
       worker [] = (Nothing, [])
-      worker ("":others) = case worker others of
+      worker ([]:others) = case worker others of
         (Nothing, res) -> (Nothing, res)
         (Just l, res) -> (Nothing, l:res)
       worker (ccs@(c:_):others) | isLinearWhiteSpace c =
@@ -68,19 +76,18 @@ parseHeader hdrLine =
     Nothing -> tell ("No : in header line " ++ hdrLine) >> return (hdrLine, "")
     Just (a, b) -> return (a, dropWhile (flip elem " \t") b)
   
-parseEmail :: String -> Errorable ([(String, String)], String)
+parseEmail :: BSL.ByteString -> Errorable ([(String, String)], BSL.ByteString)
 parseEmail what =
   do (headerLines, body) <- headersBody what
      parsedHeaders <- mapM parseHeader $ unfoldHeaderLines headerLines
      return (parsedHeaders, body)
-     
+
+stringToByteString :: String -> BSL.ByteString
+stringToByteString = BSL.pack . map (fromInteger . toInteger . ord)
+
 main :: IO ()
 main =
-  do print $ {-(map (fst . snd) . (take 5)) $ -}stateSequence $ [1,2,3,4,5]
-     print $ toSep 'z' "abcxdefxhij"
-     print $ findNewlines "foo\r\n\r\nbar\r\nbazz"
-     print $ Main.lines "Hello\r\nGoodbye\r\n\r\nfoo"
-     print $ runWriter $ headersBody "H1\r\nH2\r\nH3\r\n\r\nbody"
-     print $ unfoldHeaderLines ["L1", " C1", " C2", "L2", "L3", "L4", " C3"]
-     print $ runWriter $ parseEmail "From: foo\r\n bar\r\n\tbazz\r\nTo: Me\r\n\r\nBody"
+  do print $ runWriter $ headersBody $ stringToByteString "H1\r\nH2\r\nH3\r\n\r\nbody"
+     print $ unfoldHeaderLines $ ["L1", " C1", " C2", "L2", "L3", "L4", " C3"]
+     print $ runWriter $ parseEmail $ stringToByteString "From: foo\r\n bar\r\n\tbazz\r\nTo: Me\r\n\r\nBody"
 
