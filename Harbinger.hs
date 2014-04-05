@@ -5,7 +5,17 @@ import qualified Data.ByteString.Lazy as BSL
 import Data.Word
 import Data.Char
 
-type Errorable = Writer String
+type Errorable = Writer [String]
+
+runErrorable :: Errorable a -> Either [String] a
+runErrorable x = case runWriter x of
+  (l, []) -> Right l
+  (_, r) -> Left r
+
+data Header = Header String String deriving Show
+
+parseAscii7 :: [Word8] -> String
+parseAscii7 = map $ chr . fromInteger . toInteger
 
 stateSequence :: [a] -> [(a, ([a], [a]))]
 stateSequence elems =
@@ -48,8 +58,8 @@ headersBody :: BSL.ByteString -> Errorable ([String], BSL.ByteString)
 headersBody s =
   let ss = Main.lines s in
   case find (\((x,_),_) -> x == []) (zip ss $ inits ss) of
-    Nothing -> tell "Message has no body?" >> return ([],s)
-    Just ((_blank, body), headers) -> return (map (map (chr . fromInteger . toInteger) . fst) headers, body) 
+    Nothing -> tell ["Message has no body?"] >> return ( (map (parseAscii7 . fst) ss), BSL.empty)
+    Just ((_blank, body), headers) -> return (map (parseAscii7 . fst) headers, body) 
 
 unfoldHeaderLines :: [String] -> [String]
 unfoldHeaderLines what =
@@ -70,13 +80,13 @@ unfoldHeaderLines what =
     (Nothing, res) -> res
     (Just c, res) -> c:res
 
-parseHeader :: String -> Errorable (String, String)
+parseHeader :: String -> Errorable Header
 parseHeader hdrLine =
   case toSep ':' hdrLine of
-    Nothing -> tell ("No : in header line " ++ hdrLine) >> return (hdrLine, "")
-    Just (a, b) -> return (a, dropWhile (flip elem " \t") b)
+    Nothing -> tell ["No : in header line " ++ hdrLine] >> (return $ Header hdrLine "")
+    Just (a, b) -> return $ Header a (dropWhile (flip elem " \t") b)
   
-parseEmail :: BSL.ByteString -> Errorable ([(String, String)], BSL.ByteString)
+parseEmail :: BSL.ByteString -> Errorable ([Header], BSL.ByteString)
 parseEmail what =
   do (headerLines, body) <- headersBody what
      parsedHeaders <- mapM parseHeader $ unfoldHeaderLines headerLines
@@ -87,7 +97,8 @@ stringToByteString = BSL.pack . map (fromInteger . toInteger . ord)
 
 main :: IO ()
 main =
-  do print $ runWriter $ headersBody $ stringToByteString "H1\r\nH2\r\nH3\r\n\r\nbody"
+  do print $ runErrorable $ headersBody $ stringToByteString "H1\r\nH2\r\nH3\r\n\r\nbody"
      print $ unfoldHeaderLines $ ["L1", " C1", " C2", "L2", "L3", "L4", " C3"]
-     print $ runWriter $ parseEmail $ stringToByteString "From: foo\r\n bar\r\n\tbazz\r\nTo: Me\r\n\r\nBody"
+     print $ runErrorable $ parseEmail $ stringToByteString "From: foo\r\n bar\r\n\tbazz\r\nTo: Me\r\n\r\nBody"
+     print $ runErrorable $ parseEmail $ stringToByteString "From: foo\r\nHeader1\r\nHeader2\r\n\r\nFoo"
 
