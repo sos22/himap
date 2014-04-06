@@ -11,6 +11,7 @@ import Data.Time
 import Data.Time.Format
 import System.Locale
 import System.Directory
+import System.Posix.Files
 
 type Errorable = Writer [String]
 
@@ -25,6 +26,7 @@ data Email = Email { eml_headers :: [Header], eml_body :: BSL.ByteString } deriv
 data Journal = Journal { journal_handle :: Handle,
                          journal_path :: FilePath }
 data JournalEntry = JournalStart String
+                  | JournalAddSymlink String String
                     deriving Show
 
 openCreate :: FilePath -> IO (Maybe Handle)
@@ -42,13 +44,14 @@ openMessageJournal =
                            case ee of
                              Nothing -> tryFrom $ cntr + 1
                              Just hh -> return $ Journal { journal_handle = hh, journal_path = p }
-  in (createDirectoryIfMissing True journalDir) >> (tryFrom 0)
+  in (createDirectoryIfMissing True journalDir) >> (tryFrom (0::Int))
 
 journalWrite :: Journal -> JournalEntry -> IO ()
 journalWrite journal je =
   let h = journal_handle journal in
   case je of
     JournalStart msgId -> hPutStrLn h $ "start " ++ msgId
+    JournalAddSymlink msgId name -> hPutStrLn h $ "symlink " ++ msgId ++ " " ++ name
       
 
 parseAscii7 :: [Word8] -> String
@@ -56,8 +59,8 @@ parseAscii7 = map $ chr . fromInteger . toInteger
 
 toSep :: Eq a => a -> [a] -> Maybe ([a], [a])
 toSep sep elems =
-  let stateSequence elems = zip elems $ zip (inits elems) (tails $ tail elems)
-  in case find (\(a, _) -> a == sep) $ stateSequence elems of
+  let stateSequence = zip elems $ zip (inits elems) (tails $ tail elems)
+  in case find (\(a, _) -> a == sep) stateSequence of
     Nothing -> Nothing
     Just x -> Just $ snd x
 
@@ -153,8 +156,8 @@ ensureMessageId eml =
     Nothing ->
       do {- Pick a range big enough to be statistically unique -}
          ident <- getStdRandom $ randomR (0::Integer,1000000000000000)
-         hostName <- getHostName
-         let newIdent = (show ident) ++ "@" ++ hostName ++ "-harbinger"
+         hostname <- getHostName
+         let newIdent = (show ident) ++ "@" ++ hostname ++ "-harbinger"
          return $ eml {eml_headers = (Header "Message-Id" newIdent):(eml_headers eml)}
 
 addReceivedDate :: Email -> IO (Email, UTCTime)
@@ -165,7 +168,7 @@ addReceivedDate eml =
              now)
 
 sanitiseForPath :: String -> String
-sanitiseForPath = filter $ flip elem "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM,^@%"
+sanitiseForPath = filter $ flip elem "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM,^@%-+_:"
 
 emailPoolFile :: Email -> (String, String)
 emailPoolFile eml =
@@ -181,7 +184,7 @@ deMaybe Nothing = error "Maybe wasn't?"
 
 fileEmail :: Email -> IO ()
 fileEmail eml =
-  do (eml', when) <- ensureMessageId eml >>= addReceivedDate
+  do (eml', receivedAt) <- ensureMessageId eml >>= addReceivedDate
      let (_, poolFile) = emailPoolFile eml'
      conflict <- doesFileExist poolFile
      eml'' <- if conflict
@@ -196,10 +199,16 @@ fileEmail eml =
        else return ()
      createDirectoryIfMissing True poolDir'
      j <- openMessageJournal
-     journalWrite j (JournalStart $ deMaybe $ getHeader "Message-Id" eml'')
+     let msgId = deMaybe $ getHeader "Message-Id" eml''
+     journalWrite j $ JournalStart msgId
      hh <- openFile poolFile' WriteMode
      BSL.hPut hh $ flattenEmail eml''
      hClose hh
+     let dateSymlinkDir = Data.Time.Format.formatTime System.Locale.defaultTimeLocale "harbinger/byDate/%F/" receivedAt
+         dateSymlinkPath = dateSymlinkDir ++ (sanitiseForPath $ deMaybe $ getHeader "Message-Id" eml'')
+     createDirectoryIfMissing True dateSymlinkDir
+     journalWrite j $ JournalAddSymlink msgId dateSymlinkPath
+     createSymbolicLink ("../../../" ++ poolFile') dateSymlinkPath
      hClose $ journal_handle j
      removeFile $ journal_path j
      
