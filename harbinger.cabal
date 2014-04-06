@@ -41,7 +41,7 @@ build-type:          Simple
 -- Constraint on the version of Cabal needed to build this package.
 cabal-version:       >=1.8
 
-executable harbinger
+executable harbinger-mda
   -- .hs or .lhs file containing the Main module.
   main-is: Harbinger.hs
   
@@ -53,4 +53,7 @@ executable harbinger
 
   ghc-options: -Wall
 
-  
+executable harbinger-imap
+  main-is: Imap.hs
+  build-depends: base == 4.5.*, bytestring >= 0.9, network >= 2.3
+  ghc-options: -Wall
