@@ -65,14 +65,16 @@ data ResponseState = ResponseStateOk
                    | ResponseStateBad
                    | ResponseStateNone
                      deriving Show
-data ResponseAttribute = ResponseAttribute
+data ResponseAttribute = ResponseAttribute String
                          deriving Show
 attrToString :: ResponseAttribute -> String
-attrToString = error "No attributes yet"
+attrToString (ResponseAttribute x) = x
 
 data ImapCommand = ImapNoop
                  | ImapCapability
                  | ImapLogin String String
+                 | ImapList String String
+                 | ImapSelect String
                  | ImapCommandBad String
                    deriving Show
      
@@ -231,7 +233,26 @@ readCommand =
                                        username <- parseAstring
                                        requireChar ' '
                                        password <- parseAstring
-                                       return $ ImapLogin username password)]
+                                       return $ ImapLogin username password),
+                          ("LIST", do requireChar ' '
+                                      referenceName <- parseMailbox
+                                      requireChar ' '
+                                      listMailbox <- parseListMailbox
+                                      return $ ImapList referenceName listMailbox),
+                          ("SELECT", do requireChar ' '
+                                        liftM ImapSelect parseMailbox)]
+        parseMailbox = do s <- parseAstring
+                          return $ if "inbox" == map toLower s 
+                                   then "INBOX"
+                                   else s
+        parseListMailbox = alternates [parseLiteral,
+                                       parseQuoted,
+                                       parseMany1 parseListChar]
+        parseListChar = do c <- readChar
+                           if (c `elem` "(){ \\\"") || (ord c < 32)
+                             then parseBacktrack
+                             else return c
+
 
 processCommand :: Either String (ResponseTag, ImapCommand) -> ImapServer ()
 processCommand (Left err) =
@@ -244,8 +265,24 @@ processCommand (Right (tag, cmd)) =
     ImapNoop -> sendResponseOk tag [] "Done noop"
     ImapLogin username password -> trace ("login as " ++ username ++ ", password " ++ password) $
                                    sendResponseOk tag [] "Logged in"
+    ImapList reference mailbox ->
+      if reference /= "" || (not $ mailbox `elem` ["", "INBOX"])
+      then sendResponseBad tag [] "LIST bad mailbox or reference"
+      else do sendResponse ResponseUntagged ResponseStateNone [] "LIST () \"/\" \"INBOX\""
+              sendResponseOk tag [] "LIST completed"
+    ImapSelect mailbox ->
+      if mailbox /= "INBOX"
+      then sendResponseBad tag [] "SELECT non-existent mailbox"
+      else do sendResponse ResponseUntagged ResponseStateNone [] "5 EXISTS"
+              sendResponse ResponseUntagged ResponseStateNone [] "1 RECENT"
+              sendResponse ResponseUntagged ResponseStateNone [] "FLAGS ()"
+              sendResponse ResponseUntagged ResponseStateNone [] "OK [UNSEEN 3]"
+              sendResponse ResponseUntagged ResponseStateNone [] "OK [UIDVALIDITY 12345]" -- epoch
+              sendResponse ResponseUntagged ResponseStateNone [] "OK [UIDNEXT 27]" -- next UID with epoch
+              sendResponse ResponseUntagged ResponseStateNone [] "OK [PERMANENTFLAGS ()]"
+              sendResponseOk tag [ResponseAttribute "READ-WRITE"] "SELECT completed"
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
-    
+
 untilError :: ImapServer a -> ImapServer ()
 untilError server = ImapServer $ \state ->
   do r <- run_is server state
