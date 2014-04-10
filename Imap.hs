@@ -70,11 +70,38 @@ data ResponseAttribute = ResponseAttribute String
 attrToString :: ResponseAttribute -> String
 attrToString (ResponseAttribute x) = x
 
+data ByteRange = ByteRange Int Int
+               deriving Show
+data MimeSectionPath = MimeSectionPath [Int]
+                     deriving Show
+data SectionSpec = SectionMsgText
+                 | SectionMsgHeaderFields Bool [String]
+                 | SectionMsgHeader
+                 | SectionMsgMime
+                 | SectionSubPart MimeSectionPath (Maybe SectionSpec)
+                   deriving Show
+data MsgSequenceNumber = MsgSequenceNumber Int
+                       | MsgSequenceNumberMax
+                         deriving Show
+  
+data FetchAttribute = FetchAttrBody Bool (Maybe SectionSpec) (Maybe ByteRange)
+                    | FetchAttrBodyStructure
+                    | FetchAttrEnvelope
+                    | FetchAttrFlags
+                    | FetchAttrInternalDate
+                    | FetchAttrRfc822
+                    | FetchAttrRfc822Size
+                    | FetchAttrRfc822Header
+                    | FetchAttrRfc822Text
+                    | FetchAttrUid
+                      deriving Show
+                               
 data ImapCommand = ImapNoop
                  | ImapCapability
                  | ImapLogin String String
                  | ImapList String String
                  | ImapSelect String
+                 | ImapFetch [MsgSequenceNumber] [FetchAttribute]
                  | ImapCommandBad String
                    deriving Show
      
@@ -150,7 +177,9 @@ alternates options = ImapServer $ worker options
                Left ImapStopBacktrack -> worker opts state
                Left err -> return $ Left err
                Right res2 -> return $ Right res2
-        
+optional :: ImapServer a -> ImapServer (Maybe a)        
+optional what = alternates [liftM Just what, return Nothing]
+
 runWithErrs :: ImapServer a -> ImapServer (Either String a)
 runWithErrs underlying = ImapServer $ \state ->
   do res <- run_is underlying state
@@ -222,7 +251,12 @@ readCommand =
         parseMany1 what = do r <- what
                              alternates [do res <- parseMany1 what
                                             return $ r:res,
-                                         return []]
+                                         return [r]]
+        parseMany1Sep sep elm = do r <- elm
+                                   alternates [ do _ <- sep
+                                                   res <- parseMany1Sep sep elm
+                                                   return $ r:res,
+                                                return [r] ]
         parseAstringChar = do c <- readChar
                               if (c `elem` "(){ %*\"\\") || (ord c < 32)
                                 then parseBacktrack
@@ -240,7 +274,86 @@ readCommand =
                                       listMailbox <- parseListMailbox
                                       return $ ImapList referenceName listMailbox),
                           ("SELECT", do requireChar ' '
-                                        liftM ImapSelect parseMailbox)]
+                                        liftM ImapSelect parseMailbox),
+                          ("FETCH", do requireChar ' '
+                                       seqs <- parseSequenceSet
+                                       requireChar ' '
+                                       attrs <- alternates [do requireString "ALL"
+                                                               return [FetchAttrFlags,
+                                                                       FetchAttrInternalDate,
+                                                                       FetchAttrRfc822Size,
+                                                                       FetchAttrEnvelope],
+                                                            do requireString "FAST"
+                                                               return [FetchAttrFlags,
+                                                                       FetchAttrInternalDate,
+                                                                       FetchAttrRfc822Size],
+                                                            do requireString "FULL"
+                                                               return [FetchAttrFlags,
+                                                                       FetchAttrInternalDate,
+                                                                       FetchAttrRfc822Size,
+                                                                       FetchAttrEnvelope,
+                                                                       FetchAttrBody False Nothing Nothing],
+                                                            do requireChar '('
+                                                               r <- parseMany1Sep (requireChar ' ') parseFetchAttr
+                                                               requireChar ')'
+                                                               return r,
+                                                            liftM (\x -> [x]) parseFetchAttr]
+                                       return $ ImapFetch seqs attrs)]
+        parseSequenceSet = liftM concat $ parseMany1Sep (requireChar ',') $ do n <- parseSeqNumber
+                                                                               alternates [ do requireChar ':'
+                                                                                               r <- parseSeqNumber
+                                                                                               return (case (n, r) of
+                                                                                                          (MsgSequenceNumber n',
+                                                                                                           MsgSequenceNumber r') -> map MsgSequenceNumber [n'..r']
+                                                                                                          (MsgSequenceNumber n',
+                                                                                                           MsgSequenceNumberMax) -> map MsgSequenceNumber [n'..]
+                                                                                                          (MsgSequenceNumberMax, _) -> []),
+                                                                                            return [n]]
+        parseSeqNumber = alternates [liftM MsgSequenceNumber parseNumber,
+                                     (requireChar '*' >> return MsgSequenceNumberMax)]
+        parseSection = do requireChar '['
+                          r <- optional parseSectionSpec
+                          requireChar ']'
+                          return r
+        parseSectionSpec = alternates [parseSectionMsgText,
+                                       do part <- parseSectionPart
+                                          rest <- optional $ (requireChar '.' >> parseSectionText)
+                                          return $ SectionSubPart part rest]
+        parseSectionMsgText = alternates [(requireString "TEXT" >> return SectionMsgText),
+                                          do requireString "HEADER.FIELDS"
+                                             invert <- alternates [requireString "NOT" >> return True,
+                                                                   return False]
+                                             requireChar ' '
+                                             headers <- parseHeaderList
+                                             return $ SectionMsgHeaderFields invert headers,
+                                          (requireString "HEADER" >> return SectionMsgHeader)]
+        parseSectionPart = liftM MimeSectionPath $ parseMany1Sep (requireChar '.') parseNumber
+        parseSectionText = alternates [parseSectionMsgText, (requireString "MIME" >> return SectionMsgMime)]
+        parseHeaderList = do requireChar '('
+                             r <- parseMany1Sep (requireChar ' ') parseHeaderFldName
+                             requireChar ')'
+                             return r
+        parseHeaderFldName = parseAstring
+        parseFetchAttr = alternates [(requireString "ENVELOPE" >> return FetchAttrEnvelope),
+                                     (requireString "FLAGS" >> return FetchAttrFlags),
+                                     (requireString "INTERNALDATE" >> return FetchAttrInternalDate),
+                                     (requireString "RFC822.HEADER" >> return FetchAttrRfc822Header),
+                                     (requireString "RFC822.SIZE" >> return FetchAttrRfc822Size),
+                                     (requireString "RFC822.TEXT" >> return FetchAttrRfc822Text),
+                                     (requireString "RFC822" >> return FetchAttrRfc822),
+                                     (requireString "UID" >> return FetchAttrUid),
+                                     (requireString "BODYSTRUCTURE" >> return FetchAttrBodyStructure),
+                                     (requireString "BODY" >>
+                                      do peek <- alternates [(requireString ".PEEK" >> return True),
+                                                             return False]
+                                         section <- liftM join $ optional parseSection
+                                         byteRange <- optional $ do requireChar '<'
+                                                                    l <- parseNumber
+                                                                    requireChar '.'
+                                                                    r <- parseNumber
+                                                                    requireChar '>'
+                                                                    return $ ByteRange l r
+                                         return $ FetchAttrBody peek section byteRange)]
         parseMailbox = do s <- parseAstring
                           return $ if "inbox" == map toLower s 
                                    then "INBOX"
@@ -281,6 +394,8 @@ processCommand (Right (tag, cmd)) =
               sendResponse ResponseUntagged ResponseStateNone [] "OK [UIDNEXT 27]" -- next UID with epoch
               sendResponse ResponseUntagged ResponseStateNone [] "OK [PERMANENTFLAGS ()]"
               sendResponseOk tag [ResponseAttribute "READ-WRITE"] "SELECT completed"
+    ImapFetch _ _ ->
+      sendResponseBad tag [] "Don't do fetch yet"
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
 untilError :: ImapServer a -> ImapServer ()
