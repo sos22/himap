@@ -6,6 +6,7 @@ import Control.Exception
 import Control.Monad
 import Data.Char
 import Data.IORef
+import Data.List
 import Data.Word
 import Debug.Trace
 
@@ -14,6 +15,8 @@ ignore = flip (>>) $ return ()
 
 stringToByteString :: String -> BS.ByteString
 stringToByteString = BS.pack . map (fromInteger.toInteger.ord)
+byteStringToString :: BS.ByteString -> String
+byteStringToString = map (chr.fromInteger.toInteger) . BS.unpack
 
 data ImapServerState = ImapServerState { iss_handle :: Handle, 
                                          iss_outgoing_response :: [BS.ByteString],
@@ -52,7 +55,7 @@ queueResponse what = ImapServer $ \isState ->
 finishResponse :: ImapServer ()
 finishResponse = ImapServer $ \isState ->
   let worker [] = return ()
-      worker (x:xs) = worker xs >> BS.hPut (iss_handle isState) x
+      worker (x:xs) = worker xs >> ((trace $ "sending " ++ (byteStringToString x)) $ BS.hPut (iss_handle isState) x)
   in do worker (iss_outgoing_response isState)
         hFlush (iss_handle isState)
         return $ Right (isState {iss_outgoing_response = []}, ())
@@ -138,7 +141,8 @@ lookaheadByte = ImapServer worker
           do inbuf <- readIORef $ iss_inbuf state
              if iss_inbuf_idx state >= BS.length inbuf
                then do nextChunk <- BS.hGetSome (iss_handle state) 4096
-                       if BS.length nextChunk == 0
+                       trace ("grabbed chunk " ++ (byteStringToString nextChunk)) $
+                         if BS.length nextChunk == 0
                          then return $ Left ImapStopFinished
                          else do modifyIORef (iss_inbuf state) (flip BS.append nextChunk)
                                  worker state
@@ -386,18 +390,58 @@ processCommand (Right (tag, cmd)) =
     ImapSelect mailbox ->
       if mailbox /= "INBOX"
       then sendResponseBad tag [] "SELECT non-existent mailbox"
-      else do sendResponse ResponseUntagged ResponseStateNone [] "5 EXISTS"
+      else do sendResponse ResponseUntagged ResponseStateNone [] "1 EXISTS"
               sendResponse ResponseUntagged ResponseStateNone [] "1 RECENT"
               sendResponse ResponseUntagged ResponseStateNone [] "FLAGS ()"
-              sendResponse ResponseUntagged ResponseStateNone [] "OK [UNSEEN 3]"
+              sendResponse ResponseUntagged ResponseStateNone [] "OK [UNSEEN 1]"
               sendResponse ResponseUntagged ResponseStateNone [] "OK [UIDVALIDITY 12345]" -- epoch
               sendResponse ResponseUntagged ResponseStateNone [] "OK [UIDNEXT 27]" -- next UID with epoch
               sendResponse ResponseUntagged ResponseStateNone [] "OK [PERMANENTFLAGS ()]"
               sendResponseOk tag [ResponseAttribute "READ-WRITE"] "SELECT completed"
-    ImapFetch _ _ ->
-      sendResponseBad tag [] "Don't do fetch yet"
+    ImapFetch sequenceNumbers attributes ->
+      do sequence_ $ map (fetchMessage attributes) sequenceNumbers
+         sendResponseOk tag [] "FETCH completed"
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
+-- For now, only one message.
+loadMessage :: MsgSequenceNumber -> ImapServer ()
+loadMessage _ = return ()
+
+extractMessageHeader :: String -> () -> Maybe String
+extractMessageHeader "FROM" () = Just "From: fromaddr"
+extractMessageHeader "TO" () = Just "To: toaddr"
+extractMessageHeader "SUBJECT" () = Just "Subject: the subject line"
+extractMessageHeader "DATE" () = Just "Date: 1983-Apr-24"
+extractMessageHeader _ _ = Nothing
+
+extractMessageHeaders :: Bool -> [String] -> () -> String
+extractMessageHeaders False headers msg =
+  (intercalate "\r\n" $ dropNothing $ map (flip extractMessageHeader msg) headers) ++ "\r\n"
+  where dropNothing [] = []
+        dropNothing (Nothing:x) = dropNothing x
+        dropNothing ((Just y):x) = y:(dropNothing x)
+        
+renderLiteralString :: String -> String
+renderLiteralString x =
+  "{" ++ (show $ length x) ++ "}\r\n" ++ x
+  
+grabMessageAttribute :: FetchAttribute -> () -> ImapServer (String, String)
+grabMessageAttribute attr msg =
+  case attr of
+    FetchAttrUid -> return ("UID", "7")
+    FetchAttrFlags -> return ("FLAGS", "(\\Seen)")
+    FetchAttrInternalDate -> return ("INTERNALDATE", "\"10-Apr-2004\"") -- date must be in double quotes to keep mutt happy
+    FetchAttrRfc822Size -> return ("RFC822.SIZE", "99")
+    FetchAttrBody _peek (Just (SectionMsgHeaderFields invert headers)) Nothing ->
+      return ("BODY", "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers msg) ++ "\r\n")
+
+fetchMessage :: [FetchAttribute] -> MsgSequenceNumber -> ImapServer ()
+fetchMessage attrs seq@(MsgSequenceNumber i) =
+  do msg <- loadMessage seq
+     results <- mapM (flip grabMessageAttribute msg) attrs
+     let res = foldr (\(a, b) c -> a:b:c) [] results
+     sendResponse ResponseUntagged ResponseStateNone [] $ (show i) ++ " FETCH (" ++ (intercalate " " res) ++ ")"
+  
 untilError :: ImapServer a -> ImapServer ()
 untilError server = ImapServer $ \state ->
   do r <- run_is server state
