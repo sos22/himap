@@ -1,3 +1,4 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 import Network
 import qualified Data.ByteString as BS
 import System.IO
@@ -99,12 +100,16 @@ data FetchAttribute = FetchAttrBody Bool (Maybe SectionSpec) (Maybe ByteRange)
                     | FetchAttrUid
                       deriving Show
                                
+newtype MsgUid = MsgUid Int
+               deriving (Show, Enum)
+                     
 data ImapCommand = ImapNoop
                  | ImapCapability
                  | ImapLogin String String
                  | ImapList String String
                  | ImapSelect String
                  | ImapFetch [MsgSequenceNumber] [FetchAttribute]
+                 | ImapFetchUid [MsgUid] [FetchAttribute]
                  | ImapCommandBad String
                    deriving Show
      
@@ -241,13 +246,17 @@ readCommand =
                               '\\' -> do c' <- readChar
                                          liftM ((:) c') worker
                               _ -> liftM ((:) c) worker
-        parseNumber = worker 0
-                      where worker acc =
-                              do c <- lookaheadChar
-                                 if not (c `elem` "1234567890")
-                                   then return acc
-                                   else do _ <- readChar
-                                           worker $ (acc * 10) + (digitToInt c)
+        parseNumber =
+          do c <- lookaheadChar
+             if not $ c `elem` "1234567890"
+               then parseBacktrack
+               else worker 0
+               where worker acc =
+                       do c <- lookaheadChar
+                          if not (c `elem` "1234567890")
+                            then return acc
+                            else do _ <- readChar
+                                    worker $ (acc * 10) + (digitToInt c)
         parseLiteral = do requireChar '{'
                           cnt <- parseNumber
                           requireString "}\r\n"
@@ -282,27 +291,33 @@ readCommand =
                           ("FETCH", do requireChar ' '
                                        seqs <- parseSequenceSet
                                        requireChar ' '
-                                       attrs <- alternates [do requireString "ALL"
-                                                               return [FetchAttrFlags,
-                                                                       FetchAttrInternalDate,
-                                                                       FetchAttrRfc822Size,
-                                                                       FetchAttrEnvelope],
-                                                            do requireString "FAST"
-                                                               return [FetchAttrFlags,
-                                                                       FetchAttrInternalDate,
-                                                                       FetchAttrRfc822Size],
-                                                            do requireString "FULL"
-                                                               return [FetchAttrFlags,
-                                                                       FetchAttrInternalDate,
-                                                                       FetchAttrRfc822Size,
-                                                                       FetchAttrEnvelope,
-                                                                       FetchAttrBody False Nothing Nothing],
-                                                            do requireChar '('
-                                                               r <- parseMany1Sep (requireChar ' ') parseFetchAttr
-                                                               requireChar ')'
-                                                               return r,
-                                                            liftM (\x -> [x]) parseFetchAttr]
-                                       return $ ImapFetch seqs attrs)]
+                                       attrs <- parseFetchAttributes
+                                       return $ ImapFetch seqs attrs),
+                          ("UID FETCH ", do uids <- parseUidSet
+                                            requireChar ' '
+                                            attrs <- parseFetchAttributes
+                                            return $ ImapFetchUid uids attrs)]
+
+        parseFetchAttributes = alternates [do requireString "ALL"
+                                              return [FetchAttrFlags,
+                                                      FetchAttrInternalDate,
+                                                      FetchAttrRfc822Size,
+                                                      FetchAttrEnvelope],
+                                           do requireString "FAST"
+                                              return [FetchAttrFlags,
+                                                      FetchAttrInternalDate,
+                                                      FetchAttrRfc822Size],
+                                           do requireString "FULL"
+                                              return [FetchAttrFlags,
+                                                      FetchAttrInternalDate,
+                                                      FetchAttrRfc822Size,
+                                                      FetchAttrEnvelope,
+                                                      FetchAttrBody False Nothing Nothing],
+                                           do requireChar '('
+                                              r <- parseMany1Sep (requireChar ' ') parseFetchAttr
+                                              requireChar ')'
+                                              return r,
+                                           liftM (\x -> [x]) parseFetchAttr]
         parseSequenceSet = liftM concat $ parseMany1Sep (requireChar ',') $ do n <- parseSeqNumber
                                                                                alternates [ do requireChar ':'
                                                                                                r <- parseSeqNumber
@@ -313,8 +328,15 @@ readCommand =
                                                                                                            MsgSequenceNumberMax) -> map MsgSequenceNumber [n'..]
                                                                                                           (MsgSequenceNumberMax, _) -> []),
                                                                                             return [n]]
+        parseUidSet = liftM concat $ parseMany1Sep (requireChar ',') $ do n <- parseUid
+                                                                          m <- optional $ do requireChar ':'
+                                                                                             parseUid
+                                                                          return $ case m of
+                                                                            Nothing -> [n]
+                                                                            Just m' -> [n..m']
         parseSeqNumber = alternates [liftM MsgSequenceNumber parseNumber,
                                      (requireChar '*' >> return MsgSequenceNumberMax)]
+        parseUid = liftM MsgUid parseNumber
         parseSection = do requireChar '['
                           r <- optional parseSectionSpec
                           requireChar ']'
@@ -401,11 +423,16 @@ processCommand (Right (tag, cmd)) =
     ImapFetch sequenceNumbers attributes ->
       do sequence_ $ map (fetchMessage attributes) sequenceNumbers
          sendResponseOk tag [] "FETCH completed"
+    ImapFetchUid uids attributes ->
+      do sequence_ $ map (fetchMessageUid attributes) uids
+         sendResponseOk tag [] "UID FETCH complete"
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
 -- For now, only one message.
 loadMessage :: MsgSequenceNumber -> ImapServer ()
 loadMessage _ = return ()
+loadMessageByUid :: MsgUid -> ImapServer ()
+loadMessageByUid _ = return ()
 
 extractMessageHeader :: String -> () -> Maybe String
 extractMessageHeader "FROM" () = Just "From: fromaddr"
@@ -425,21 +452,31 @@ renderLiteralString :: String -> String
 renderLiteralString x =
   "{" ++ (show $ length x) ++ "}\r\n" ++ x
   
-grabMessageAttribute :: FetchAttribute -> () -> ImapServer (String, String)
+grabMessageAttribute :: FetchAttribute -> () -> ImapServer [(String, String)]
 grabMessageAttribute attr msg =
   case attr of
-    FetchAttrUid -> return ("UID", "7")
-    FetchAttrFlags -> return ("FLAGS", "(\\Seen)")
-    FetchAttrInternalDate -> return ("INTERNALDATE", "\"10-Apr-2004\"") -- date must be in double quotes to keep mutt happy
-    FetchAttrRfc822Size -> return ("RFC822.SIZE", "99")
+    FetchAttrUid -> return [("UID", "7")]
+    FetchAttrFlags -> return [("FLAGS", "(\\Seen)")]
+    FetchAttrInternalDate -> return [("INTERNALDATE", "\"10-Apr-2004\"")] -- date must be in double quotes to keep mutt happy
+    FetchAttrRfc822Size -> return [("RFC822.SIZE", "99")]
     FetchAttrBody _peek (Just (SectionMsgHeaderFields invert headers)) Nothing ->
-      return ("BODY", "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers msg) ++ "\r\n")
-
+      return [("BODY", "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers msg) ++ "\r\n")]
+    FetchAttrBody _peek Nothing Nothing ->
+      return [("UID", "7"),
+              ("BODY[]", renderLiteralString "From: fromaddr\r\nTo: toaddr\r\nSubject: the subject line\r\nDate: 1983-Apr-24\r\n\r\nThis is the body\r\n")]
+      
 fetchMessage :: [FetchAttribute] -> MsgSequenceNumber -> ImapServer ()
 fetchMessage attrs seq@(MsgSequenceNumber i) =
   do msg <- loadMessage seq
      results <- mapM (flip grabMessageAttribute msg) attrs
-     let res = foldr (\(a, b) c -> a:b:c) [] results
+     let res = concatMap (concatMap $ \(a, b) -> [a,b]) results
+     sendResponse ResponseUntagged ResponseStateNone [] $ (show i) ++ " FETCH (" ++ (intercalate " " res) ++ ")"
+
+fetchMessageUid :: [FetchAttribute] -> MsgUid -> ImapServer ()
+fetchMessageUid attrs seq@(MsgUid i) =
+  do msg <- loadMessageByUid seq
+     results <- mapM (flip grabMessageAttribute msg) attrs
+     let res = concatMap (concatMap $ \(a, b) -> [a,b]) results
      sendResponse ResponseUntagged ResponseStateNone [] $ (show i) ++ " FETCH (" ++ (intercalate " " res) ++ ")"
   
 untilError :: ImapServer a -> ImapServer ()
