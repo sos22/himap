@@ -12,6 +12,9 @@ import Data.Time.Format
 import System.Locale
 import System.Directory
 import System.Posix.Files
+import qualified Database.SQLite3 as DS
+import qualified Data.Text as DT
+import Control.Exception.Base
 
 type Errorable = Writer [String]
 
@@ -211,12 +214,64 @@ fileEmail eml =
      createSymbolicLink ("../../../" ++ poolFile') dateSymlinkPath
      hClose $ journal_handle j
      removeFile $ journal_path j
+
+withStatement :: DS.Database -> DT.Text -> (DS.Statement -> IO x) -> IO x
+withStatement db stmt what =
+  do prepped <- DS.prepare db stmt
+     (what prepped) `finally` (DS.finalize prepped)
+
+runStatement :: DS.Statement -> IO [[DS.SQLData]]
+runStatement s = do r <- DS.step s
+                    case r of
+                      DS.Done -> return []
+                      DS.Row -> (DS.columns s) >>=
+                                (flip liftM (runStatement s) . (:))
+                                
+dbQuery :: DS.Database -> DT.Text -> IO [[DS.SQLData]]                                      
+dbQuery db query = withStatement db query runStatement 
+
+{- Our database schema is a massive abuse.  All of the data gets
+jammed into one table, keyed off of (messageID, attributeID), with a
+single non-key field containing the value of the attribute.  We then
+rely entirely on higher-level correctness to make sure that the
+content of the database is vaguely sane, with no DB-level constraints
+at all.  The main reason for that is that I want to be able to add
+more attributes later on without having to do a schema upgrade. -}
+initialiseDatabase :: DS.Database -> IO ()
+initialiseDatabase db =
+  let stmts = map (DS.exec db . DT.pack)
+              ["BEGIN TRANSACTION",
+               "CREATE TABLE Messages (MessageId INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, Location TEXT NOT NULL)",
+               "CREATE TABLE Attributes (AttributeId INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, Description TEXT NOT NULL)",
+               "CREATE TABLE MessageAttrs (MessageId REFERENCES Messages(MessageId) NOT NULL, AttributeId REFERENCES Attributes(AttributeId) NOT NULL, Value NOT NULL, PRIMARY KEY (MessageId, AttributeId) ON CONFLICT REPLACE)",
+               "CREATE UNIQUE INDEX AttributeRmap ON Attributes (Description)",
+               "CREATE INDEX AttrRmap ON MessageAttrs (AttributeId, Value)",
+               "CREATE TABLE HarbingerVersion (Version INTEGER)",
+               "INSERT INTO HarbingerVersion (Version) VALUES (1)",
+               "END TRANSACTION"]
+  in sequence_ stmts
      
 main :: IO ()
 main =
-  do parsed <- liftM (runErrorable . parseEmail) BSL.getContents
+  do database <- DS.open $ DT.pack "harbinger.db"
+     version <-
+       catchJust
+       (\exception -> if DS.sqlError exception == DS.ErrorError
+                      then Just ()
+                      else Nothing)
+       (do versions <- dbQuery database $ DT.pack "SELECT Version FROM HarbingerVersion"
+           case versions of
+             [] -> error "version table exists but is empty?"
+             [[DS.SQLInteger n]] | n > 0 -> return n
+             (_:_:_) -> error $ "version table contains multiple entries? " ++ (show versions)
+             [x] -> error $ "version number is not a positive integer? " ++ (show x))
+       (\() -> return 0)
+     case version of
+       0 -> initialiseDatabase database
+       1 -> return ()
+       _ -> error $ "Database is in version " ++ (show version) ++ ", but we only support version 1"
+     parsed <- liftM (runErrorable . parseEmail) BSL.getContents
      case parsed of
        Left errs -> print errs
        Right parsed' -> fileEmail parsed'
-     
 
