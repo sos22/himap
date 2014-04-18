@@ -15,6 +15,7 @@ import System.Posix.Files
 import qualified Database.SQLite3 as DS
 import qualified Data.Text as DT
 import Control.Exception.Base
+import Data.Int
 
 type Errorable = Writer [String]
 
@@ -30,6 +31,7 @@ data Journal = Journal { journal_handle :: Handle,
                          journal_path :: FilePath }
 data JournalEntry = JournalStart String
                   | JournalAddSymlink String String
+                  | JournalRegisterMessage String Int64
                     deriving Show
 
 openCreate :: FilePath -> IO (Maybe Handle)
@@ -52,10 +54,10 @@ openMessageJournal =
 journalWrite :: Journal -> JournalEntry -> IO ()
 journalWrite journal je =
   let h = journal_handle journal in
-  case je of
-    JournalStart msgId -> hPutStrLn h $ "start " ++ msgId
-    JournalAddSymlink msgId name -> hPutStrLn h $ "symlink " ++ msgId ++ " " ++ name
-      
+  hPutStrLn h $ case je of
+    JournalStart msgId -> "start " ++ msgId
+    JournalAddSymlink msgId name -> "symlink " ++ msgId ++ " " ++ name
+    JournalRegisterMessage msgId msgDbId -> "register " ++ msgId ++ " " ++ (show msgDbId)
 
 parseAscii7 :: [Word8] -> String
 parseAscii7 = map $ chr . fromInteger . toInteger
@@ -185,8 +187,47 @@ deMaybe :: Maybe a -> a
 deMaybe (Just x) = x
 deMaybe Nothing = error "Maybe wasn't?"
 
-fileEmail :: Email -> IO ()
-fileEmail eml =
+addDbRow :: DS.Database -> String -> [DS.SQLData] -> IO ()
+addDbRow database table values =
+  withStatement database (DT.pack $ "INSERT INTO " ++ table ++ " VALUES (" ++ (intercalate ", " (map (const "?") values)) ++ ")") $ \stmt ->
+  do DS.bind stmt values
+     DS.step stmt
+     DS.columns stmt >>= print
+     
+addAttribute :: DS.Database -> [(String, Int64)] -> Int64 -> String -> DS.SQLData -> IO ()
+addAttribute database attribs msgId attribName value =
+  case lookup attribName attribs of
+    Nothing -> error $ "Bad attribute " ++ (show attribName)
+    Just attrib -> addDbRow database "MessageAttrs" [DS.SQLInteger msgId, DS.SQLInteger attrib, value]
+    
+transactional :: DS.Database -> IO a -> IO a
+transactional database what =
+  let end = DS.exec database (DT.pack "END TRANSACTION") in
+  do DS.exec database (DT.pack "BEGIN TRANSACTION")
+     res <- what `Control.Exception.Base.catch` (\(e::DS.SQLError) -> end >> throw e)
+     (end >> return res) `Control.Exception.Base.catch` (\e -> if DS.sqlError e == DS.ErrorBusy
+                                                               then transactional database what
+                                                               else throw e)
+                                                     
+allocMsgDbId :: DS.Database -> IO Int64
+allocMsgDbId database =
+  transactional database $
+  withStatement database (DT.pack "SELECT Val FROM NextMessageId") $ \stmt ->
+  do r <- DS.step stmt
+     case r of
+       DS.Row -> do v <- DS.columns stmt
+                    case v of
+                      [DS.SQLInteger nextId] ->
+                        withStatement database (DT.pack "UPDATE NextMessageId SET Val = ?") $ \stmt' ->
+                        do DS.bindInt64 stmt' (DS.ParamIndex 1) (nextId + 1)
+                           DS.step stmt'
+                           DS.step stmt'
+                           return nextId
+                      _ -> error $ "NextMessageId table contained unexpected value " ++ (show v)
+       _ -> error $ "Cannot query NextMessageId table"
+
+fileEmail :: DS.Database -> [(String,Int64)] -> Email -> IO ()
+fileEmail database attribs eml =
   do (eml', receivedAt) <- ensureMessageId eml >>= addReceivedDate
      let (_, poolFile) = emailPoolFile eml'
      conflict <- doesFileExist poolFile
@@ -212,6 +253,11 @@ fileEmail eml =
      createDirectoryIfMissing True dateSymlinkDir
      journalWrite j $ JournalAddSymlink msgId dateSymlinkPath
      createSymbolicLink ("../../../" ++ poolFile') dateSymlinkPath
+     msgDbId <- allocMsgDbId database
+     journalWrite j $ JournalRegisterMessage msgId msgDbId
+     addDbRow database "Messages" [DS.SQLInteger msgDbId, DS.SQLText $ DT.pack poolFile']
+     addAttribute database attribs msgDbId "rfc822.Message-Id" (DS.SQLText $ DT.pack msgId)
+     addAttribute database attribs msgDbId "harbinger.Seen" (DS.SQLInteger 0)
      hClose $ journal_handle j
      removeFile $ journal_path j
 
@@ -241,16 +287,33 @@ initialiseDatabase :: DS.Database -> IO ()
 initialiseDatabase db =
   let stmts = map (DS.exec db . DT.pack)
               ["BEGIN TRANSACTION",
-               "CREATE TABLE Messages (MessageId INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, Location TEXT NOT NULL)",
+               "CREATE TABLE NextMessageId (Val INTEGER)",
+               "INSERT INTO NextMessageId (Val) VALUES (1)",
+               "CREATE TABLE Messages (MessageId INTEGER PRIMARY KEY NOT NULL, Location TEXT NOT NULL)",
                "CREATE TABLE Attributes (AttributeId INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, Description TEXT NOT NULL)",
-               "CREATE TABLE MessageAttrs (MessageId REFERENCES Messages(MessageId) NOT NULL, AttributeId REFERENCES Attributes(AttributeId) NOT NULL, Value NOT NULL, PRIMARY KEY (MessageId, AttributeId) ON CONFLICT REPLACE)",
+               "CREATE TABLE MessageAttrs (MessageId REFERENCES Messages(MessageId) NOT NULL, AttributeId REFERENCES Attributes(AttributeId) NOT NULL, Value NOT NULL)",
                "CREATE UNIQUE INDEX AttributeRmap ON Attributes (Description)",
                "CREATE INDEX AttrRmap ON MessageAttrs (AttributeId, Value)",
+               "INSERT INTO Attributes (Description) VALUES ('rfc822.Message-Id')",
+               "INSERT INTO Attributes (Description) VALUES ('harbinger.Seen')",
                "CREATE TABLE HarbingerVersion (Version INTEGER)",
                "INSERT INTO HarbingerVersion (Version) VALUES (1)",
                "END TRANSACTION"]
   in sequence_ stmts
      
+loadAttributeTable :: DS.Database -> IO [(String, Int64)]
+loadAttributeTable database =
+  withStatement database (DT.pack "SELECT * FROM Attributes") worker
+  where worker stmt = do r <- DS.step stmt
+                         case r of
+                           DS.Row ->
+                             do v <- DS.columns stmt
+                                case v of
+                                  [DS.SQLInteger attribId, DS.SQLText description] ->
+                                    liftM ((:) (DT.unpack description, attribId)) $ worker stmt
+                                  _ -> error $ "Unexpected entry " ++ (show v) ++ " in message attributes table"
+                           DS.Done -> return []
+                           
 main :: IO ()
 main =
   do database <- DS.open $ DT.pack "harbinger.db"
@@ -270,8 +333,10 @@ main =
        0 -> initialiseDatabase database
        1 -> return ()
        _ -> error $ "Database is in version " ++ (show version) ++ ", but we only support version 1"
+     attribs <- loadAttributeTable database
+     print attribs
      parsed <- liftM (runErrorable . parseEmail) BSL.getContents
      case parsed of
        Left errs -> print errs
-       Right parsed' -> fileEmail parsed'
+       Right parsed' -> fileEmail database attribs parsed'
 
