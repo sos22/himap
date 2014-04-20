@@ -253,7 +253,7 @@ main =
        _ -> error $ "Database is in version " ++ (show version) ++ ", but we only support version 1"
      attribs <- loadAttributeTable database
      print attribs
-     parsed <- liftM (runErrorable . parseEmail) BS.getContents
+     parsed <- liftM (runErrorable . parseEmail undefined {- Don't need UIDs here -}) BS.getContents
      case parsed of
        Left errs -> print errs
        Right parsed' -> fileEmail database attribs parsed'

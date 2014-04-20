@@ -1,5 +1,7 @@
-module Email(Email(Email, eml_headers, eml_body),
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+module Email(Email(Email, eml_headers, eml_body, eml_uid),
              Header(Header),
+             MsgUid(MsgUid),
              parseEmail) where
 
 import Control.Monad.Writer.Lazy
@@ -7,11 +9,17 @@ import qualified Data.ByteString as BS
 import Data.Char
 import Data.List
 import Data.Word
+import Data.Int
 
 import Util
 
+newtype MsgUid = MsgUid Int64
+               deriving (Show, Enum, Ord, Eq)
+
 data Header = Header String String deriving Show
-data Email = Email { eml_headers :: [Header], eml_body :: BS.ByteString } deriving Show
+data Email = Email { eml_headers :: [Header],
+                     eml_body :: BS.ByteString, 
+                     eml_uid :: MsgUid } deriving Show
 
 parseAscii7 :: [Word8] -> String
 parseAscii7 = map $ chr . fromInteger . toInteger
@@ -82,9 +90,11 @@ extractHeader hdrLine =
     Nothing -> tell ["No : in header line " ++ hdrLine] >> (return $ Header hdrLine "")
     Just (a, b) -> return $ Header a (dropWhile (flip elem " \t") b)
 
-parseEmail :: BS.ByteString -> Errorable Email
-parseEmail what =
+parseEmail :: MsgUid -> BS.ByteString -> Errorable Email
+parseEmail uid what =
   do (headerLines, body) <- headersBody what
      parsedHeaders <- mapM extractHeader $ unfoldHeaderLines headerLines
-     return $ Email parsedHeaders body
+     return $ Email {eml_headers = parsedHeaders, 
+                     eml_body = body,
+                     eml_uid = uid}
 

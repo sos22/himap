@@ -1,4 +1,3 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 import Network
 import System.IO
 import Control.Concurrent
@@ -12,7 +11,6 @@ import Debug.Trace
 import qualified Database.SQLite3 as DS
 import qualified Data.Text as DT
 import qualified Data.ByteString as BS
-import Data.Int
 
 import Email
 import Util
@@ -122,9 +120,6 @@ data FetchAttribute = FetchAttrBody Bool (Maybe SectionSpec) (Maybe ByteRange)
                     | FetchAttrUid
                       deriving Show
                                
-newtype MsgUid = MsgUid Int64
-               deriving (Show, Enum, Ord, Eq)
-                     
 data ImapCommand = ImapNoop
                  | ImapCapability
                  | ImapLogin String String
@@ -519,13 +514,13 @@ liftServer what = ImapServer $ \state ->
      return $ Right $ (,) state r
 
 loadMessageByUid :: MsgUid -> ImapServer Email
-loadMessageByUid (MsgUid uid) =
+loadMessageByUid uu@(MsgUid uid) =
   do pathQ <- dbQuery "SELECT Location FROM Messages WHERE MessageId = ?" [DS.SQLInteger uid]
      let path = case pathQ of
            [[DS.SQLText pth]] -> DT.unpack pth
            _ -> error $ "Unexpected message path " ++ (show pathQ) ++ " for UID " ++ (show uid)
      content <- liftServer $ BS.readFile path
-     case runErrorable $ parseEmail content of
+     case runErrorable $ parseEmail uu content of
        Left errs -> error $ "Cannot parse " ++ path ++ " which is already in the database? (" ++ (show errs) ++ ")"
        Right res -> return res
 
@@ -568,11 +563,13 @@ renderLiteralString x =
 renderQuotedString :: String -> String  
 renderQuotedString x = "\"" ++ x ++ "\""
 
+uidToByteString :: MsgUid -> BS.ByteString
+uidToByteString (MsgUid i) = stringToByteString $ show i
 -- UNIMPLEMENTED
 grabMessageAttribute :: FetchAttribute -> Email -> ImapServer [(String, BS.ByteString)]
 grabMessageAttribute attr msg =
   case attr of
-    FetchAttrUid -> return [("UID", stringToByteString "7")]
+    FetchAttrUid -> return [("UID", uidToByteString $ eml_uid msg)]
     FetchAttrFlags -> return [("FLAGS", stringToByteString "(\\Seen)")]
     FetchAttrInternalDate ->
       return $ case extractMessageHeader "date" msg of
@@ -583,7 +580,7 @@ grabMessageAttribute attr msg =
       return [("BODY",
                stringToByteString $ "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers msg) ++ "\r\n")]
     FetchAttrBody _peek Nothing Nothing ->
-      return [("UID", stringToByteString "7"),
+      return [("UID", uidToByteString $ eml_uid msg),
               ("BODY[]", renderLiteralByteString $ extractFullMessage msg)]
       
 fetchMessage :: [FetchAttribute] -> MsgSequenceNumber -> ImapServer ()
