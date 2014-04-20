@@ -55,5 +55,5 @@ executable harbinger-mda
 
 executable harbinger-imap
   main-is: Imap.hs
-  build-depends: base == 4.5.*, bytestring >= 0.9, network >= 2.3, text >= 0.11, direct-sqlite >= 2.3
+  build-depends: base == 4.5.*, bytestring >= 0.9, network >= 2.3, text >= 0.11, direct-sqlite >= 2.3, mtl >= 2.0
   ghc-options: -Wall

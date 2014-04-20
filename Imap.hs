@@ -12,6 +12,7 @@ import Debug.Trace
 import qualified Database.SQLite3 as DS
 import qualified Data.Text as DT
 import qualified Data.ByteString as BS
+import Data.Int
 
 import Email
 import Util
@@ -121,7 +122,7 @@ data FetchAttribute = FetchAttrBody Bool (Maybe SectionSpec) (Maybe ByteRange)
                     | FetchAttrUid
                       deriving Show
                                
-newtype MsgUid = MsgUid Int
+newtype MsgUid = MsgUid Int64
                deriving (Show, Enum, Ord, Eq)
                      
 data ImapCommand = ImapNoop
@@ -278,6 +279,7 @@ readCommand =
                               '\\' -> do c' <- readChar
                                          liftM ((:) c') worker
                               _ -> liftM ((:) c) worker
+        parseNumber :: Integral a => ImapServer a
         parseNumber =
           do c <- lookaheadChar
              if not $ c `elem` "1234567890"
@@ -288,7 +290,7 @@ readCommand =
                           if not (c `elem` "1234567890")
                             then return acc
                             else do _ <- readChar
-                                    worker $ (acc * 10) + (digitToInt c)
+                                    worker $ (acc * 10) + (fromInteger $ toInteger $ digitToInt c)
         parseLiteral = do requireChar '{'
                           cnt <- parseNumber
                           requireString "}\r\n"
@@ -509,15 +511,23 @@ loadMessage (MsgSequenceNumber seqNr) = ImapServer $ \state ->
   let uids = iss_uids state
   in if seqNr <= 0 || seqNr > length uids
      then return $ Left $ ImapStopFailed $ "invalid message sequence number " ++ (show seqNr) ++ "; max " ++ (show $ length uids)
-     else run_is (loadMessageByUid $ uids !! seqNr) state
+     else run_is (loadMessageByUid $ uids !! (seqNr - 1)) state
 
--- UNIMPLEMENTED
+liftServer :: IO a -> ImapServer a
+liftServer what = ImapServer $ \state ->
+  do r <- what
+     return $ Right $ (,) state r
+
 loadMessageByUid :: MsgUid -> ImapServer Email
-loadMessageByUid _ = return $ Email { eml_headers = [Header "From" "fromaddr",
-                                                     Header "To" "toaddr",
-                                                     Header "Subject" "The subject line",
-                                                     Header "Date" "1983-Apr-24"],
-                                      eml_body = stringToByteString "Message body goes here" }
+loadMessageByUid (MsgUid uid) =
+  do pathQ <- dbQuery "SELECT Location FROM Messages WHERE MessageId = ?" [DS.SQLInteger uid]
+     let path = case pathQ of
+           [[DS.SQLText pth]] -> DT.unpack pth
+           _ -> error $ "Unexpected message path " ++ (show pathQ) ++ " for UID " ++ (show uid)
+     content <- liftServer $ BS.readFile path
+     case runErrorable $ parseEmail content of
+       Left errs -> error $ "Cannot parse " ++ path ++ " which is already in the database? (" ++ (show errs) ++ ")"
+       Right res -> return res
 
 {- Grab a message header, including both the header name and the value components. -}
 extractMessageHeaderFull :: String -> Email -> Maybe String

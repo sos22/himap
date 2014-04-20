@@ -2,7 +2,6 @@
 import Data.List
 import Control.Monad.Writer.Lazy
 import qualified Data.ByteString as BS
-import Data.Word
 import Data.Char
 import System.IO
 import System.Random
@@ -19,13 +18,6 @@ import Data.Int
 
 import Email
 import Util
-
-type Errorable = Writer [String]
-
-runErrorable :: Errorable a -> Either [String] a
-runErrorable x = case runWriter x of
-  (l, []) -> Right l
-  (_, r) -> Left r
 
 data Journal = Journal { journal_handle :: Handle,
                          journal_path :: FilePath }
@@ -58,81 +50,6 @@ journalWrite journal je =
     JournalStart msgId -> "start " ++ msgId
     JournalAddSymlink msgId name -> "symlink " ++ msgId ++ " " ++ name
     JournalRegisterMessage msgId msgDbId -> "register " ++ msgId ++ " " ++ (show msgDbId)
-
-parseAscii7 :: [Word8] -> String
-parseAscii7 = map $ chr . fromInteger . toInteger
-
-toSep :: Eq a => a -> [a] -> Maybe ([a], [a])
-toSep sep elems =
-  let stateSequence = zip elems $ zip (inits elems) (tails $ tail elems)
-  in case find (\(a, _) -> a == sep) stateSequence of
-    Nothing -> Nothing
-    Just x -> Just $ snd x
-
-{- Nothing represents newlines -}
-findNewlines :: BS.ByteString -> [(Maybe Word8, BS.ByteString)]
-findNewlines bsl =
-  let tl = BS.tail bsl
-      hd = BS.head bsl
-      hdtl = BS.head tl
-      tltl = BS.tail tl
-  in if BS.null bsl
-     then []
-     else if BS.null tl
-          then [(Just hd, BS.empty)]
-          else if or [BS.null tltl, hd /= 13, hdtl /= 10]
-               then (Just hd, tl):(findNewlines tl)
-               else (Nothing, tltl):(findNewlines tltl)
-
-lines :: BS.ByteString -> [([Word8], BS.ByteString)]
-lines s =
-  let worker :: [Word8] -> [(Maybe Word8, BS.ByteString)] -> [([Word8], BS.ByteString)]
-      worker fromPrevNewline remainder =
-        case remainder of
-          [] -> [(fromPrevNewline, BS.empty)]
-          ((Nothing, trailer):rest) ->
-            (fromPrevNewline, trailer):(worker [] rest)
-          ((Just c, _):rest) ->
-            worker (fromPrevNewline ++ [c]) rest
-  in worker [] $ findNewlines s
-
-headersBody :: BS.ByteString -> Errorable ([String], BS.ByteString)
-headersBody s =
-  let ss = Main.lines s in
-  case find (\((x,_),_) -> x == []) (zip ss $ inits ss) of
-    Nothing -> tell ["Message has no body?"] >> return ( (map (parseAscii7 . fst) ss), BS.empty)
-    Just ((_blank, body), headers) -> return (map (parseAscii7 . fst) headers, body) 
-
-unfoldHeaderLines :: [String] -> [String]
-unfoldHeaderLines what =
-  let isLinearWhiteSpace c = c `elem` " \t"
-      worker :: [String] -> (Maybe String, [String])
-      worker [] = (Nothing, [])
-      worker ([]:others) = case worker others of
-        (Nothing, res) -> (Nothing, res)
-        (Just l, res) -> (Nothing, l:res)
-      worker (ccs@(c:_):others) | isLinearWhiteSpace c =
-        case worker others of
-          (Nothing, res) -> (Just ccs, res)
-          (Just r, res) -> (Just (ccs ++ r), res)
-        | otherwise = case worker others of
-          (Nothing, res) -> (Nothing, ccs:res)
-          (Just e, res) -> (Nothing, (ccs ++ e):res)
-  in case worker what of
-    (Nothing, res) -> res
-    (Just c, res) -> c:res
-
-extractHeader :: String -> Errorable Header
-extractHeader hdrLine =
-  case toSep ':' hdrLine of
-    Nothing -> tell ["No : in header line " ++ hdrLine] >> (return $ Header hdrLine "")
-    Just (a, b) -> return $ Header a (dropWhile (flip elem " \t") b)
-
-parseEmail :: BS.ByteString -> Errorable Email
-parseEmail what =
-  do (headerLines, body) <- headersBody what
-     parsedHeaders <- mapM extractHeader $ unfoldHeaderLines headerLines
-     return $ Email parsedHeaders body
 
 flattenHeader :: Header -> BS.ByteString
 flattenHeader (Header name value) = BS.concat $ map stringToByteString [name, ": ", value, "\r\n"]
