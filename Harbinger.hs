@@ -257,7 +257,9 @@ fileEmail database attribs eml =
      journalWrite j $ JournalRegisterMessage msgId msgDbId
      addDbRow database "Messages" [DS.SQLInteger msgDbId, DS.SQLText $ DT.pack poolFile']
      addAttribute database attribs msgDbId "rfc822.Message-Id" (DS.SQLText $ DT.pack msgId)
-     addAttribute database attribs msgDbId "harbinger.Seen" (DS.SQLInteger 0)
+     addAttribute database attribs msgDbId "harbinger.seen" (DS.SQLInteger 0)
+     addAttribute database attribs msgDbId "harbinger.recent" (DS.SQLInteger 1)
+     addAttribute database attribs msgDbId "harbinger.mailbox" (DS.SQLText $ DT.pack "INBOX")
      hClose $ journal_handle j
      removeFile $ journal_path j
 
@@ -295,7 +297,9 @@ initialiseDatabase db =
                "CREATE UNIQUE INDEX AttributeRmap ON Attributes (Description)",
                "CREATE INDEX AttrRmap ON MessageAttrs (AttributeId, Value)",
                "INSERT INTO Attributes (Description) VALUES ('rfc822.Message-Id')",
-               "INSERT INTO Attributes (Description) VALUES ('harbinger.Seen')",
+               "INSERT INTO Attributes (Description) VALUES ('harbinger.seen')",
+               "INSERT INTO Attributes (Description) VALUES ('harbinger.mailbox')",
+               "INSERT INTO Attributes (Description) VALUES ('harbinger.recent')",
                "CREATE TABLE HarbingerVersion (Version INTEGER)",
                "INSERT INTO HarbingerVersion (Version) VALUES (1)",
                "END TRANSACTION"]
