@@ -446,6 +446,8 @@ dbQuery what binders = ImapServer $ \state ->
 unpackMsgUid :: DS.SQLData -> MsgUid
 unpackMsgUid (DS.SQLInteger i) = MsgUid $ fromInteger $ toInteger i
 unpackMsgUid other = error $ "Bad msg UID " ++ (show other)
+packMsgUid :: MsgUid -> DS.SQLData
+packMsgUid (MsgUid i) = DS.SQLInteger $ fromInteger $ toInteger i
 
 processCommand :: Either String (ResponseTag, ImapCommand) -> ImapServer ()
 processCommand (Left err) =
@@ -565,23 +567,81 @@ renderQuotedString x = "\"" ++ x ++ "\""
 
 uidToByteString :: MsgUid -> BS.ByteString
 uidToByteString (MsgUid i) = stringToByteString $ show i
--- UNIMPLEMENTED
+
+attributeId :: String -> ImapServer DS.SQLData
+attributeId name = ImapServer $ \state ->
+  return $ Right (state,
+                  maybe
+                    (error $ "Bad message attribute " ++ name)
+                    id
+                    (lookup name $ iss_attributes state))
+  
+fetchMessageFlag :: Email -> String -> ImapServer Bool
+fetchMessageFlag eml flagName =
+  let uid = eml_uid eml in
+  do attrId <- attributeId flagName
+     q <- dbQuery "SELECT Value FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ?"
+          [packMsgUid uid, attrId]
+     return $
+       foldr (\entry acc ->
+               case entry of
+                 [DS.SQLInteger 0] -> acc
+                 [DS.SQLInteger 1] -> True
+                 _ -> error $ "strange result " ++ (show entry) ++ " from flag query uid " ++ (show uid) ++ " flag name " ++ flagName
+                 )
+       False
+       q
+
+clearFlag :: Email -> String -> ImapServer ()
+clearFlag eml flagName =
+  let uid = eml_uid eml in
+  do attrId <- attributeId flagName
+     ignore $
+       dbQuery
+       "DELETE FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ?"
+       [packMsgUid uid, attrId]
+       
+setFlag :: Email -> String -> ImapServer ()
+setFlag eml flagName =
+  let uid = eml_uid eml in
+  do attrId <- attributeId flagName
+     ignore $
+       dbQuery
+       "INSERT OR REPLACE INTO MessageAttrs (MessageId, AttributeId, Value) VALUES (?, ?, 1)"
+       [packMsgUid uid, attrId]
+       
 grabMessageAttribute :: FetchAttribute -> Email -> ImapServer [(String, BS.ByteString)]
 grabMessageAttribute attr msg =
   case attr of
     FetchAttrUid -> return [("UID", uidToByteString $ eml_uid msg)]
-    FetchAttrFlags -> return [("FLAGS", stringToByteString "(\\Seen)")]
+    FetchAttrFlags ->
+      do seen <- fetchMessageFlag msg "harbinger.seen"
+         recent <- fetchMessageFlag msg "harbinger.recent"
+         let r = if recent
+                 then (:) "\\Recent"
+                 else id
+             s = if seen
+                 then (:) "\\Seen"
+                 else id
+             flags = r $ s []
+         return [("FLAGS", stringToByteString $ "(" ++ (intercalate " " flags) ++ ")")]
     FetchAttrInternalDate ->
       return $ case extractMessageHeader "date" msg of
         Nothing -> []
         Just v -> [("INTERNALDATE", stringToByteString $ renderQuotedString v)]
     FetchAttrRfc822Size -> return [("RFC822.SIZE", stringToByteString $ show $ BS.length $ eml_body msg)]
-    FetchAttrBody _peek (Just (SectionMsgHeaderFields invert headers)) Nothing ->
-      return [("BODY",
-               stringToByteString $ "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers msg) ++ "\r\n")]
-    FetchAttrBody _peek Nothing Nothing ->
-      return [("UID", uidToByteString $ eml_uid msg),
-              ("BODY[]", renderLiteralByteString $ extractFullMessage msg)]
+    FetchAttrBody peek sectionspec byterange ->
+      do clearFlag msg "harbinger.recent"
+         if not peek
+           then setFlag msg "harbinger.seen"
+           else return ()
+         case (sectionspec, byterange) of
+           ((Just (SectionMsgHeaderFields invert headers)), Nothing) ->
+             return [("BODY",
+                      stringToByteString $ "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers msg) ++ "\r\n")]
+           (Nothing, Nothing) ->
+             return [("UID", uidToByteString $ eml_uid msg),
+                     ("BODY[]", renderLiteralByteString $ extractFullMessage msg)]
       
 fetchMessage :: [FetchAttribute] -> MsgSequenceNumber -> ImapServer ()
 fetchMessage attrs seqNr@(MsgSequenceNumber i) =
