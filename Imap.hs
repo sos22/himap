@@ -1,6 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 import Network
-import qualified Data.ByteString as BS
 import System.IO
 import Control.Concurrent
 import Control.Exception
@@ -12,14 +11,13 @@ import Data.Word
 import Debug.Trace
 import qualified Database.SQLite3 as DS
 import qualified Data.Text as DT
+import qualified Data.ByteString as BS
+
+import Email
+import Util
 
 ignore :: Monad m => m a -> m ()
 ignore = flip (>>) $ return ()
-
-stringToByteString :: String -> BS.ByteString
-stringToByteString = BS.pack . map (fromInteger.toInteger.ord)
-byteStringToString :: BS.ByteString -> String
-byteStringToString = map (chr.fromInteger.toInteger) . BS.unpack
 
 data ImapServerState = ImapServerState { iss_handle :: Handle, 
                                          iss_outgoing_response :: [BS.ByteString],
@@ -66,11 +64,13 @@ runImapServer hndle is =
                          iss_database = database, 
                          iss_attributes = error "failed to load attributes DB?"}
 
-queueResponse :: String -> ImapServer ()
-queueResponse what = ImapServer $ \isState ->
-  return $ Right (isState {iss_outgoing_response = (stringToByteString what):
-                                                   (iss_outgoing_response isState)},
+queueResponseBs :: BS.ByteString -> ImapServer ()
+queueResponseBs what = ImapServer $ \state ->
+  return $ Right (state {iss_outgoing_response = what:(iss_outgoing_response state)},
                   ())
+  
+queueResponse :: String -> ImapServer ()
+queueResponse = queueResponseBs . stringToByteString
 
 finishResponse :: ImapServer ()
 finishResponse = ImapServer $ \isState ->
@@ -134,8 +134,9 @@ data ImapCommand = ImapNoop
                  | ImapCommandBad String
                    deriving Show
      
-sendResponse :: ResponseTag -> ResponseState -> [ResponseAttribute] -> String -> ImapServer ()
-sendResponse tag state attrs resp =
+
+sendResponse_ :: ResponseTag -> ResponseState -> [ResponseAttribute] -> Either String BS.ByteString -> ImapServer ()
+sendResponse_ tag state attrs resp =
   do case tag of
        ResponseUntagged -> queueResponse "*"
        ResponseTagged tag' -> queueResponse tag'
@@ -151,9 +152,19 @@ sendResponse tag state attrs resp =
                      w [x] = queueResponse x >> w []
                      w (x:xs) = queueResponse x >> queueResponse " " >> w xs
                  in queueResponse " [" >> w attrs'
-     queueResponse resp
+     case resp of
+       Left resp' -> queueResponse resp'
+       Right resp' -> queueResponseBs resp'
      queueResponse "\r\n"
      finishResponse
+
+sendResponse :: ResponseTag -> ResponseState -> [ResponseAttribute] -> String -> ImapServer ()
+sendResponse tag state attrs resp =
+  (sendResponse_ tag state attrs . Left) resp
+
+sendResponseBs :: ResponseTag -> ResponseState -> [ResponseAttribute] -> BS.ByteString -> ImapServer ()
+sendResponseBs tag state attrs resp =
+  (sendResponse_ tag state attrs . Right) resp
 
 sendResponseOk :: ResponseTag -> [ResponseAttribute] -> String -> ImapServer ()
 sendResponseOk t = sendResponse t ResponseStateOk
@@ -493,63 +504,99 @@ processCommand (Right (tag, cmd)) =
          sendResponseOk tag [] "UID FETCH complete"
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
-data Message = Message
-
--- For now, only one message.
-loadMessage :: MsgSequenceNumber -> ImapServer Message
+loadMessage :: MsgSequenceNumber -> ImapServer Email
 loadMessage (MsgSequenceNumber seqNr) = ImapServer $ \state ->
   let uids = iss_uids state
   in if seqNr <= 0 || seqNr > length uids
      then return $ Left $ ImapStopFailed $ "invalid message sequence number " ++ (show seqNr) ++ "; max " ++ (show $ length uids)
      else run_is (loadMessageByUid $ uids !! seqNr) state
 
-loadMessageByUid :: MsgUid -> ImapServer Message
-loadMessageByUid _ = return Message
+-- UNIMPLEMENTED
+loadMessageByUid :: MsgUid -> ImapServer Email
+loadMessageByUid _ = return $ Email { eml_headers = [Header "From" "fromaddr",
+                                                     Header "To" "toaddr",
+                                                     Header "Subject" "The subject line",
+                                                     Header "Date" "1983-Apr-24"],
+                                      eml_body = stringToByteString "Message body goes here" }
 
-extractMessageHeader :: String -> Message -> Maybe String
-extractMessageHeader "FROM" _ = Just "From: fromaddr"
-extractMessageHeader "TO" _ = Just "To: toaddr"
-extractMessageHeader "SUBJECT" _ = Just "Subject: the subject line"
-extractMessageHeader "DATE" _ = Just "Date: 1983-Apr-24"
-extractMessageHeader _ _ = Nothing
+{- Grab a message header, including both the header name and the value components. -}
+extractMessageHeaderFull :: String -> Email -> Maybe String
+extractMessageHeaderFull headerName eml =
+  let hn = map toLower headerName in
+  fmap (\(Header h v) -> h ++ ": " ++ v) $ find (\(Header h _) -> (map toLower h) == hn) $ eml_headers eml
+{- Just the value of the header -}
+extractMessageHeader :: String -> Email -> Maybe String
+extractMessageHeader headerName eml =
+  let hn = map toLower headerName in
+  fmap (\(Header _ v) -> v) $ find (\(Header h _) -> (map toLower h) == hn) $ eml_headers eml
 
-extractMessageHeaders :: Bool -> [String] -> Message -> String
+extractFullMessage :: Email -> BS.ByteString
+extractFullMessage eml =
+  BS.intercalate (stringToByteString "\r\n") $
+  foldr (\(Header h v) rest -> (stringToByteString $ h ++ ": " ++ v):rest) [BS.empty, eml_body eml] $
+  eml_headers eml
+
+extractMessageHeaders :: Bool -> [String] -> Email -> String
 extractMessageHeaders False headers msg =
-  (intercalate "\r\n" $ dropNothing $ map (flip extractMessageHeader msg) headers) ++ "\r\n"
+  (intercalate "\r\n" $ dropNothing $ map (flip extractMessageHeaderFull msg) headers) ++ "\r\n"
   where dropNothing [] = []
         dropNothing (Nothing:x) = dropNothing x
         dropNothing ((Just y):x) = y:(dropNothing x)
         
+renderLiteralByteString :: BS.ByteString -> BS.ByteString
+renderLiteralByteString x =
+  BS.concat [ stringToByteString "{",
+              stringToByteString $ show $ BS.length x,
+              stringToByteString "}\r\n",
+              x]
 renderLiteralString :: String -> String
 renderLiteralString x =
-  "{" ++ (show $ length x) ++ "}\r\n" ++ x
-  
-grabMessageAttribute :: FetchAttribute -> Message -> ImapServer [(String, String)]
+  concat [ "{",
+           show $ length x,
+           "}\r\n",
+           x]
+renderQuotedString :: String -> String  
+renderQuotedString x = "\"" ++ x ++ "\""
+
+-- UNIMPLEMENTED
+grabMessageAttribute :: FetchAttribute -> Email -> ImapServer [(String, BS.ByteString)]
 grabMessageAttribute attr msg =
   case attr of
-    FetchAttrUid -> return [("UID", "7")]
-    FetchAttrFlags -> return [("FLAGS", "(\\Seen)")]
-    FetchAttrInternalDate -> return [("INTERNALDATE", "\"10-Apr-2004\"")] -- date must be in double quotes to keep mutt happy
-    FetchAttrRfc822Size -> return [("RFC822.SIZE", "99")]
+    FetchAttrUid -> return [("UID", stringToByteString "7")]
+    FetchAttrFlags -> return [("FLAGS", stringToByteString "(\\Seen)")]
+    FetchAttrInternalDate ->
+      return $ case extractMessageHeader "date" msg of
+        Nothing -> []
+        Just v -> [("INTERNALDATE", stringToByteString $ renderQuotedString v)]
+    FetchAttrRfc822Size -> return [("RFC822.SIZE", stringToByteString $ show $ BS.length $ eml_body msg)]
     FetchAttrBody _peek (Just (SectionMsgHeaderFields invert headers)) Nothing ->
-      return [("BODY", "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers msg) ++ "\r\n")]
+      return [("BODY",
+               stringToByteString $ "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers msg) ++ "\r\n")]
     FetchAttrBody _peek Nothing Nothing ->
-      return [("UID", "7"),
-              ("BODY[]", renderLiteralString "From: fromaddr\r\nTo: toaddr\r\nSubject: the subject line\r\nDate: 1983-Apr-24\r\n\r\nThis is the body\r\n")]
+      return [("UID", stringToByteString "7"),
+              ("BODY[]", renderLiteralByteString $ extractFullMessage msg)]
       
 fetchMessage :: [FetchAttribute] -> MsgSequenceNumber -> ImapServer ()
 fetchMessage attrs seqNr@(MsgSequenceNumber i) =
   do msg <- loadMessage seqNr
      results <- mapM (flip grabMessageAttribute msg) attrs
-     let res = concatMap (concatMap $ \(a, b) -> [a,b]) results
-     sendResponse ResponseUntagged ResponseStateNone [] $ (show i) ++ " FETCH (" ++ (intercalate " " res) ++ ")"
+     let res = concatMap (concatMap $ \(a, b) -> [stringToByteString a,b]) results
+     sendResponseBs ResponseUntagged ResponseStateNone [] $
+       BS.concat [stringToByteString $ show i,
+                  stringToByteString " FETCH (",
+                  BS.intercalate (stringToByteString " ") res,
+                  stringToByteString ")"]
 
 fetchMessageUid :: [FetchAttribute] -> MsgUid -> ImapServer ()
 fetchMessageUid attrs uid@(MsgUid i) =
   do msg <- loadMessageByUid uid
      results <- mapM (flip grabMessageAttribute msg) attrs
-     let res = concatMap (concatMap $ \(a, b) -> [a,b]) results
-     sendResponse ResponseUntagged ResponseStateNone [] $ (show i) ++ " FETCH (" ++ (intercalate " " res) ++ ")"
+     let res = concatMap (concatMap $ \(a, b) -> [stringToByteString a,b]) results
+     sendResponseBs ResponseUntagged ResponseStateNone [] $
+       BS.concat [ stringToByteString $ show i, 
+                   stringToByteString " FETCH (",
+                   BS.intercalate (stringToByteString " ") res,
+                   stringToByteString ")"]
   
 untilError :: ImapServer a -> ImapServer a
 untilError server = ImapServer $ \state ->

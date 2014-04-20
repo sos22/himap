@@ -1,7 +1,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 import Data.List
 import Control.Monad.Writer.Lazy
-import qualified Data.ByteString.Lazy as BSL
+import qualified Data.ByteString as BS
 import Data.Word
 import Data.Char
 import System.IO
@@ -17,15 +17,15 @@ import qualified Data.Text as DT
 import Control.Exception.Base
 import Data.Int
 
+import Email
+import Util
+
 type Errorable = Writer [String]
 
 runErrorable :: Errorable a -> Either [String] a
 runErrorable x = case runWriter x of
   (l, []) -> Right l
   (_, r) -> Left r
-
-data Header = Header String String deriving Show
-data Email = Email { eml_headers :: [Header], eml_body :: BSL.ByteString } deriving Show
 
 data Journal = Journal { journal_handle :: Handle,
                          journal_path :: FilePath }
@@ -70,37 +70,37 @@ toSep sep elems =
     Just x -> Just $ snd x
 
 {- Nothing represents newlines -}
-findNewlines :: BSL.ByteString -> [(Maybe Word8, BSL.ByteString)]
+findNewlines :: BS.ByteString -> [(Maybe Word8, BS.ByteString)]
 findNewlines bsl =
-  let tl = BSL.tail bsl
-      hd = BSL.head bsl
-      hdtl = BSL.head tl
-      tltl = BSL.tail tl
-  in if BSL.null bsl
+  let tl = BS.tail bsl
+      hd = BS.head bsl
+      hdtl = BS.head tl
+      tltl = BS.tail tl
+  in if BS.null bsl
      then []
-     else if BSL.null tl
-          then [(Just hd, BSL.empty)]
-          else if or [BSL.null tltl, hd /= 13, hdtl /= 10]
+     else if BS.null tl
+          then [(Just hd, BS.empty)]
+          else if or [BS.null tltl, hd /= 13, hdtl /= 10]
                then (Just hd, tl):(findNewlines tl)
                else (Nothing, tltl):(findNewlines tltl)
 
-lines :: BSL.ByteString -> [([Word8], BSL.ByteString)]
+lines :: BS.ByteString -> [([Word8], BS.ByteString)]
 lines s =
-  let worker :: [Word8] -> [(Maybe Word8, BSL.ByteString)] -> [([Word8], BSL.ByteString)]
+  let worker :: [Word8] -> [(Maybe Word8, BS.ByteString)] -> [([Word8], BS.ByteString)]
       worker fromPrevNewline remainder =
         case remainder of
-          [] -> [(fromPrevNewline, BSL.empty)]
+          [] -> [(fromPrevNewline, BS.empty)]
           ((Nothing, trailer):rest) ->
             (fromPrevNewline, trailer):(worker [] rest)
           ((Just c, _):rest) ->
             worker (fromPrevNewline ++ [c]) rest
   in worker [] $ findNewlines s
 
-headersBody :: BSL.ByteString -> Errorable ([String], BSL.ByteString)
+headersBody :: BS.ByteString -> Errorable ([String], BS.ByteString)
 headersBody s =
   let ss = Main.lines s in
   case find (\((x,_),_) -> x == []) (zip ss $ inits ss) of
-    Nothing -> tell ["Message has no body?"] >> return ( (map (parseAscii7 . fst) ss), BSL.empty)
+    Nothing -> tell ["Message has no body?"] >> return ( (map (parseAscii7 . fst) ss), BS.empty)
     Just ((_blank, body), headers) -> return (map (parseAscii7 . fst) headers, body) 
 
 unfoldHeaderLines :: [String] -> [String]
@@ -128,21 +128,18 @@ extractHeader hdrLine =
     Nothing -> tell ["No : in header line " ++ hdrLine] >> (return $ Header hdrLine "")
     Just (a, b) -> return $ Header a (dropWhile (flip elem " \t") b)
 
-parseEmail :: BSL.ByteString -> Errorable Email
+parseEmail :: BS.ByteString -> Errorable Email
 parseEmail what =
   do (headerLines, body) <- headersBody what
      parsedHeaders <- mapM extractHeader $ unfoldHeaderLines headerLines
      return $ Email parsedHeaders body
 
-stringToByteString :: String -> BSL.ByteString
-stringToByteString = BSL.pack . map (fromInteger . toInteger . ord)
-
-flattenHeader :: Header -> BSL.ByteString
-flattenHeader (Header name value) = BSL.concat $ map stringToByteString [name, ": ", value, "\r\n"]
+flattenHeader :: Header -> BS.ByteString
+flattenHeader (Header name value) = BS.concat $ map stringToByteString [name, ": ", value, "\r\n"]
   
-flattenEmail :: Email -> BSL.ByteString
+flattenEmail :: Email -> BS.ByteString
 flattenEmail eml =
-  BSL.append (BSL.concat $ map flattenHeader (eml_headers eml)) $ BSL.append (stringToByteString "\r\n") $ eml_body eml
+  BS.append (BS.concat $ map flattenHeader (eml_headers eml)) $ BS.append (stringToByteString "\r\n") $ eml_body eml
 
 getHeader :: String -> Email -> Maybe String
 getHeader name eml =
@@ -246,7 +243,7 @@ fileEmail database attribs eml =
      let msgId = deMaybe $ getHeader "Message-Id" eml''
      journalWrite j $ JournalStart msgId
      hh <- openFile poolFile' WriteMode
-     BSL.hPut hh $ flattenEmail eml''
+     BS.hPut hh $ flattenEmail eml''
      hClose hh
      let dateSymlinkDir = Data.Time.Format.formatTime System.Locale.defaultTimeLocale "harbinger/byDate/%F/" receivedAt
          dateSymlinkPath = dateSymlinkDir ++ (sanitiseForPath $ deMaybe $ getHeader "Message-Id" eml'')
@@ -339,7 +336,7 @@ main =
        _ -> error $ "Database is in version " ++ (show version) ++ ", but we only support version 1"
      attribs <- loadAttributeTable database
      print attribs
-     parsed <- liftM (runErrorable . parseEmail) BSL.getContents
+     parsed <- liftM (runErrorable . parseEmail) BS.getContents
      case parsed of
        Left errs -> print errs
        Right parsed' -> fileEmail database attribs parsed'
