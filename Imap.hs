@@ -127,6 +127,7 @@ data ImapCommand = ImapNoop
                  | ImapSelect String
                  | ImapFetch [MsgSequenceNumber] [FetchAttribute]
                  | ImapFetchUid [MsgUid] [FetchAttribute]
+                 | ImapStoreUid [MsgUid] (Maybe Bool) Bool [String]
                  | ImapCommandBad String
                    deriving Show
      
@@ -299,10 +300,27 @@ readCommand =
                                                    res <- parseMany1Sep sep elm
                                                    return $ r:res,
                                                 return [r] ]
+        parseManySep sep elm =                                        
+          alternates [ parseMany1Sep sep elm,
+                       return [] ]
         parseAstringChar = do c <- readChar
                               if (c `elem` "(){ %*\"\\") || (ord c < 32)
                                 then parseBacktrack
                                 else return c
+        parseFlag =
+          let worker =
+                alternates [do c <- lookaheadChar
+                               if c `elem` "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM-_\\"
+                                 then do _ <- readChar
+                                         rest <- worker
+                                         return $ c:rest
+                                 else parseBacktrack,
+                            return ""] in
+          do c <- worker
+             case c of
+               "" -> parseBacktrack
+               _ -> return c
+        
         commandParsers = [("NOOP", return ImapNoop),
                           ("CAPABILITY", return ImapCapability),
                           ("LOGIN", do requireChar ' '
@@ -325,8 +343,22 @@ readCommand =
                           ("UID FETCH ", do uids <- parseUidSet
                                             requireChar ' '
                                             attrs <- parseFetchAttributes
-                                            return $ ImapFetchUid uids attrs)]
-
+                                            return $ ImapFetchUid uids attrs),
+                          ("UID STORE ", do uids <- parseUidSet
+                                            trace ("store uids " ++ (show uids)) $ requireChar ' '
+                                            mode <- optional $ alternates [ requireString "+" >> return True,
+                                                                            requireString "-" >> return False]
+                                            trace ("mode " ++ (show mode)) $ requireString "FLAGS"
+                                            silent <- alternates [ requireString ".SILENT" >> return True,
+                                                                   return False ]
+                                            requireString " "
+                                            flags <- trace ("silent " ++ (show silent)) $
+                                                     alternates [ do trace "C1" $ requireString "("
+                                                                     r <- trace "C2" $ parseManySep (requireString " ") parseFlag
+                                                                     trace ("C3 " ++ (show r)) $ requireString ")"
+                                                                     trace "C4" $ return r,
+                                                                  parseMany1Sep (requireString " ") parseFlag ]
+                                            trace ("flags " ++ (show flags)) $ return $ ImapStoreUid uids mode silent flags)]
         parseFetchAttributes = alternates [do requireString "ALL"
                                               return [FetchAttrFlags,
                                                       FetchAttrInternalDate,
@@ -449,6 +481,29 @@ unpackMsgUid other = error $ "Bad msg UID " ++ (show other)
 packMsgUid :: MsgUid -> DS.SQLData
 packMsgUid (MsgUid i) = DS.SQLInteger $ fromInteger $ toInteger i
 
+storeUids :: ResponseTag -> Maybe Bool -> Bool -> [String] -> [MsgUid] -> ImapServer ()
+storeUids tag mode silent flags uids =
+  let flagMap = [("\\Seen", "harbinger.seen")] in
+  case sequence $ map (flip lookup flagMap) flags of
+    Nothing -> sendResponseBad tag [] "Unrecognised flags"
+    Just flags' ->
+      let doOne uid =
+            do msg <- loadMessageByUid uid
+               case mode of
+                 Nothing -> sequence_ $ flip map flagMap $ \(_, flag) ->
+                   if flag `elem` flags'
+                   then setFlag msg flag
+                   else clearFlag msg flag
+                 Just True -> sequence_ $ map (setFlag msg) flags'
+                 Just False -> sequence_ $ map (clearFlag msg) flags'
+               if not silent
+                 then do newFlags <- grabMessageAttribute FetchAttrFlags msg
+                         sendFetchResponse (1::Int) newFlags
+                 else return ()
+     in trace ("flags " ++ (show flags')) $
+       do sequence_ $ map doOne uids
+          sendResponseOk tag [] "UID STORE complete"
+           
 processCommand :: Either String (ResponseTag, ImapCommand) -> ImapServer ()
 processCommand (Left err) =
   trace ("Failed: " ++ err) $ sendResponseBad ResponseUntagged [] $ "Failed: " ++ err
@@ -501,6 +556,8 @@ processCommand (Right (tag, cmd)) =
     ImapFetchUid uids attributes ->
       do sequence_ $ map (fetchMessageUid attributes) uids
          sendResponseOk tag [] "UID FETCH complete"
+    ImapStoreUid uids mode silent flags ->
+      storeUids tag mode silent flags uids
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
 loadMessage :: MsgSequenceNumber -> ImapServer Email
@@ -607,9 +664,15 @@ setFlag eml flagName =
   do attrId <- attributeId flagName
      ignore $
        dbQuery
-       "INSERT OR REPLACE INTO MessageAttrs (MessageId, AttributeId, Value) VALUES (?, ?, 1)"
+       "UPDATE MessageAttrs SET Value = 1 WHERE MessageId = ? AND AttributeId = ?"
        [packMsgUid uid, attrId]
-       
+     nrChanges <- ImapServer $ \state ->
+       do r <- DS.changes $ iss_database state
+          return $ Right (state, r)
+     if nrChanges == 0
+       then ignore $ dbQuery "INSERT INTO MessageAttrs (MessageId, AttributeId, Value) VALUES (?, ?, 1)" [packMsgUid uid, attrId]
+       else return ()
+
 grabMessageAttribute :: FetchAttribute -> Email -> ImapServer [(String, BS.ByteString)]
 grabMessageAttribute attr msg =
   case attr of
@@ -643,27 +706,26 @@ grabMessageAttribute attr msg =
              return [("UID", uidToByteString $ eml_uid msg),
                      ("BODY[]", renderLiteralByteString $ extractFullMessage msg)]
       
+sendFetchResponse :: Show a => a -> [(String, BS.ByteString)] -> ImapServer ()
+sendFetchResponse nr attributes =
+  let res = concatMap (\(a, b) -> [stringToByteString a,b]) attributes in
+  sendResponseBs ResponseUntagged ResponseStateNone [] $
+  BS.concat [stringToByteString $ show nr,
+             stringToByteString " FETCH (",
+             BS.intercalate (stringToByteString " ") res,
+             stringToByteString ")"]
+  
 fetchMessage :: [FetchAttribute] -> MsgSequenceNumber -> ImapServer ()
 fetchMessage attrs seqNr@(MsgSequenceNumber i) =
   do msg <- loadMessage seqNr
-     results <- mapM (flip grabMessageAttribute msg) attrs
-     let res = concatMap (concatMap $ \(a, b) -> [stringToByteString a,b]) results
-     sendResponseBs ResponseUntagged ResponseStateNone [] $
-       BS.concat [stringToByteString $ show i,
-                  stringToByteString " FETCH (",
-                  BS.intercalate (stringToByteString " ") res,
-                  stringToByteString ")"]
+     results <- liftM concat $ mapM (flip grabMessageAttribute msg) attrs
+     sendFetchResponse i results
 
 fetchMessageUid :: [FetchAttribute] -> MsgUid -> ImapServer ()
 fetchMessageUid attrs uid@(MsgUid i) =
   do msg <- loadMessageByUid uid
-     results <- mapM (flip grabMessageAttribute msg) attrs
-     let res = concatMap (concatMap $ \(a, b) -> [stringToByteString a,b]) results
-     sendResponseBs ResponseUntagged ResponseStateNone [] $
-       BS.concat [ stringToByteString $ show i, 
-                   stringToByteString " FETCH (",
-                   BS.intercalate (stringToByteString " ") res,
-                   stringToByteString ")"]
+     results <- liftM concat $ mapM (flip grabMessageAttribute msg) attrs
+     sendFetchResponse i results
   
 untilError :: ImapServer a -> ImapServer a
 untilError server = ImapServer $ \state ->
