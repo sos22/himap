@@ -28,9 +28,9 @@ findNewlines bsl =
       tltl = BS.tail tl
   in if BS.null bsl
      then []
-     else if BS.null tl
-          then [(Just hd, BS.empty)]
-          else if or [BS.null tltl, hd /= 13, hdtl /= 10]
+     else if hd == 10
+          then (Nothing, tl):(findNewlines tl)
+          else if BS.null tl || hd /= 13 || hdtl /= 10
                then (Just hd, tl):(findNewlines tl)
                else (Nothing, tltl):(findNewlines tltl)
 

@@ -252,9 +252,9 @@ main =
        1 -> return ()
        _ -> error $ "Database is in version " ++ (show version) ++ ", but we only support version 1"
      attribs <- loadAttributeTable database
-     print attribs
-     parsed <- liftM (runErrorable . parseEmail) BS.getContents
-     case parsed of
-       Left errs -> print errs
+     content <- BS.getContents
+     case (runErrorable . parseEmail) content of
+       Left errs -> do print $ byteStringToString content
+                       putStrLn $ "Failed: " ++ (show errs) ++ "\n"
        Right parsed' -> fileEmail database attribs parsed'
 
