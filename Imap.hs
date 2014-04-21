@@ -158,6 +158,7 @@ data ImapCommand = ImapNoop
                  | ImapFetchUid [MsgUid] [FetchAttribute]
                  | ImapStoreUid [MsgUid] (Maybe Bool) Bool [MessageFlag]
                  | ImapExpunge
+                 | ImapClose
                  | ImapCommandBad String
                    deriving Show
      
@@ -355,6 +356,7 @@ readCommand =
         
         commandParsers = [("NOOP", return ImapNoop),
                           ("EXPUNGE", return ImapExpunge),
+                          ("CLOSE", return ImapClose),
                           ("CAPABILITY", return ImapCapability),
                           ("LOGIN", do requireChar ' '
                                        username <- parseAstring
@@ -420,7 +422,7 @@ readCommand =
         parseUidSet = liftM concat $ parseMany1Sep (requireChar ',') $ do n <- parseUid
                                                                           m <- optional $ do requireChar ':'
                                                                                              parseUid
-                                                                          return $ maybe [n] (flip uidRange n) m
+                                                                          return $ maybe [n] (uidRange n) m
         parseSeqNumber = alternates [liftM MsgSequenceNumber parseNumber,
                                      (requireChar '*' >> getMaxSeqNumber)]
         getMaxSeqNumber = ImapServer $ \state -> return $ Right (state, MsgSequenceNumber $ (length $ iss_messages state) + 1)
@@ -532,8 +534,8 @@ storeUids tag mode silent flags uids =
   in do sequence_ $ map doOne uids
         sendResponseOk tag [] "UID STORE complete"
            
-expunge :: ImapServer Bool
-expunge =
+expunge :: Bool -> ImapServer Bool
+expunge sendUntagged =
   do msgs <- ImapServer $ \state -> return $ Right (state, iss_messages state)
      mbox' <- ImapServer $ \state -> return $ Right (state, iss_selected_mbox state)
      case mbox' of
@@ -565,11 +567,12 @@ expunge =
                                                                      Left y -> y /= uid
                                                                      Right y -> msg_uid y /= uid},
                                             ())
-                          sendResponse ResponseUntagged ResponseStateNone [] $
-                            (show seqNr) ++ " EXPUNGE"
+                          if sendUntagged
+                             then sendResponse ResponseUntagged ResponseStateNone [] $
+                                  (show seqNr) ++ " EXPUNGE"
+                            else return ()
                           return True
             foldM worker True toDelete
-                                   
 
 
 processCommand :: Either String (ResponseTag, ImapCommand) -> ImapServer ()
@@ -627,10 +630,17 @@ processCommand (Right (tag, cmd)) =
          sendResponseOk tag [] "UID FETCH complete"
     ImapStoreUid uids mode silent flags ->
       storeUids tag mode silent flags uids
-    ImapExpunge -> do r <- expunge
+    ImapExpunge -> do r <- expunge True
                       if r
                         then sendResponseOk tag [] "EXPUNGE complete"
                         else sendResponseBad tag [] "EXPUNGE failed"
+    ImapClose -> do r <- expunge False
+                    if r
+                      then do ImapServer $ \state -> return $ Right (state {iss_selected_mbox = Nothing,
+                                                                            iss_messages = []},
+                                                                     ())
+                              sendResponseOk tag [] "CLOSE complete"
+                      else sendResponseBad tag [] "CLOSE failed"
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
 loadMessage :: MsgSequenceNumber -> ImapServer Message
