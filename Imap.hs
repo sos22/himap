@@ -18,14 +18,42 @@ import Util
 ignore :: Monad m => m a -> m ()
 ignore = flip (>>) $ return ()
 
+data Message = Message { msg_email :: Email,
+                         msg_uid :: DS.SQLData,
+                         msg_deleted :: IORef Bool }
+               
+type MsgUid = DS.SQLData
+
+uidRange :: MsgUid -> MsgUid -> [MsgUid]
+uidRange (DS.SQLInteger i) (DS.SQLInteger j) = map DS.SQLInteger [i..j]
+uidRange a b = error $ "bad uid range (" ++ (show a) ++ " to " ++ (show b) ++ ")"
+
+sortUids :: [MsgUid] -> [MsgUid]
+sortUids = map DS.SQLInteger . sort . map (\x -> case x of
+                                              DS.SQLInteger i -> i
+                                              _ -> error $ "bad uid to sort (" ++ (show x) ++ ")")
+  
 data ImapServerState = ImapServerState { iss_handle :: Handle, 
                                          iss_outgoing_response :: [BS.ByteString],
                                          iss_inbuf :: IORef BS.ByteString,
                                          iss_inbuf_idx :: Int,
-                                         iss_uids :: [MsgUid],
+                                         iss_messages :: [Either MsgUid Message],
                                          iss_database :: DS.Database,
-                                         iss_attributes :: [(String, DS.SQLData)]
+                                         iss_attributes :: [(String, DS.SQLData)],
+                                         iss_selected_mbox :: Maybe DT.Text
                                          }
+
+data MessageFlag = MessageFlagSeen
+                 | MessageFlagRecent
+                 | MessageFlagDeleted
+                   deriving (Show, Eq)
+allMessageFlags :: [MessageFlag]
+allMessageFlags = [MessageFlagSeen, MessageFlagRecent, MessageFlagDeleted]
+
+msgFlagName :: MessageFlag -> String
+msgFlagName MessageFlagSeen = "\\Seen"
+msgFlagName MessageFlagRecent = "\\Recent"
+msgFlagName MessageFlagDeleted = "\\Deleted"
 
 data ImapStopReason = ImapStopFinished
                     | ImapStopFailed String
@@ -59,8 +87,9 @@ runImapServer hndle is =
                          iss_outgoing_response = [],
                          iss_inbuf = inbuf, 
                          iss_inbuf_idx = 0,
-                         iss_uids = [], 
+                         iss_messages = [], 
                          iss_database = database, 
+                         iss_selected_mbox = Nothing,
                          iss_attributes = error "failed to load attributes DB?"}
 
 queueResponseBs :: BS.ByteString -> ImapServer ()
@@ -127,7 +156,8 @@ data ImapCommand = ImapNoop
                  | ImapSelect String
                  | ImapFetch [MsgSequenceNumber] [FetchAttribute]
                  | ImapFetchUid [MsgUid] [FetchAttribute]
-                 | ImapStoreUid [MsgUid] (Maybe Bool) Bool [String]
+                 | ImapStoreUid [MsgUid] (Maybe Bool) Bool [MessageFlag]
+                 | ImapExpunge
                  | ImapCommandBad String
                    deriving Show
      
@@ -318,10 +348,13 @@ readCommand =
                             return ""] in
           do c <- worker
              case c of
-               "" -> parseBacktrack
-               _ -> return c
+               "\\Seen" -> return MessageFlagSeen
+               "\\Recent" -> return MessageFlagRecent
+               "\\Deleted" -> return MessageFlagDeleted
+               _ -> parseBacktrack
         
         commandParsers = [("NOOP", return ImapNoop),
+                          ("EXPUNGE", return ImapExpunge),
                           ("CAPABILITY", return ImapCapability),
                           ("LOGIN", do requireChar ' '
                                        username <- parseAstring
@@ -387,13 +420,11 @@ readCommand =
         parseUidSet = liftM concat $ parseMany1Sep (requireChar ',') $ do n <- parseUid
                                                                           m <- optional $ do requireChar ':'
                                                                                              parseUid
-                                                                          return $ case m of
-                                                                            Nothing -> [n]
-                                                                            Just m' -> [n..m']
+                                                                          return $ maybe [n] (flip uidRange n) m
         parseSeqNumber = alternates [liftM MsgSequenceNumber parseNumber,
                                      (requireChar '*' >> getMaxSeqNumber)]
-        getMaxSeqNumber = ImapServer $ \state -> return $ Right (state, MsgSequenceNumber $ (length $ iss_uids state) + 1)
-        parseUid = liftM MsgUid parseNumber
+        getMaxSeqNumber = ImapServer $ \state -> return $ Right (state, MsgSequenceNumber $ (length $ iss_messages state) + 1)
+        parseUid = liftM DS.SQLInteger parseNumber
         parseSection = do requireChar '['
                           r <- optional parseSectionSpec
                           requireChar ']'
@@ -475,35 +506,72 @@ dbQuery what binders = ImapServer $ \state ->
      do prepped <- DS.prepare db $ DT.pack what
         (DS.bind prepped binders >> fetchAllRows prepped) `finally` (DS.finalize prepped)
 
-unpackMsgUid :: DS.SQLData -> MsgUid
-unpackMsgUid (DS.SQLInteger i) = MsgUid $ fromInteger $ toInteger i
-unpackMsgUid other = error $ "Bad msg UID " ++ (show other)
-packMsgUid :: MsgUid -> DS.SQLData
-packMsgUid (MsgUid i) = DS.SQLInteger $ fromInteger $ toInteger i
-
-storeUids :: ResponseTag -> Maybe Bool -> Bool -> [String] -> [MsgUid] -> ImapServer ()
+uidToSequenceNumber :: MsgUid -> ImapServer MsgSequenceNumber
+uidToSequenceNumber uid = ImapServer $ \state ->
+  case findIndex (\x -> case x of
+                     Left u -> u == uid
+                     Right r -> msg_uid r == uid) $ iss_messages state of
+    Nothing -> error $ "Request for unknown uid " ++ (show uid)
+    Just l -> return $ Right (state, MsgSequenceNumber (l + 1))
+storeUids :: ResponseTag -> Maybe Bool -> Bool -> [MessageFlag] -> [MsgUid] -> ImapServer ()
 storeUids tag mode silent flags uids =
-  let flagMap = [("\\Seen", "harbinger.seen")] in
-  case sequence $ map (flip lookup flagMap) flags of
-    Nothing -> sendResponseBad tag [] "Unrecognised flags"
-    Just flags' ->
-      let doOne uid =
-            do msg <- loadMessageByUid uid
-               case mode of
-                 Nothing -> sequence_ $ flip map flagMap $ \(_, flag) ->
-                   if flag `elem` flags'
-                   then setFlag msg flag
-                   else clearFlag msg flag
-                 Just True -> sequence_ $ map (setFlag msg) flags'
-                 Just False -> sequence_ $ map (clearFlag msg) flags'
-               if not silent
-                 then do newFlags <- grabMessageAttribute FetchAttrFlags msg
-                         sendFetchResponse (1::Int) newFlags
-                 else return ()
-     in trace ("flags " ++ (show flags')) $
-       do sequence_ $ map doOne uids
-          sendResponseOk tag [] "UID STORE complete"
+  let doOne uid =
+        do msg <- loadMessageByUid uid
+           case mode of
+             Nothing -> sequence_ $ flip map allMessageFlags $ \flag ->
+               (if flag `elem` flags
+                then setFlag
+                else clearFlag) flag msg
+             Just True -> sequence_ $ map (flip setFlag msg) flags
+             Just False -> sequence_ $ map (flip clearFlag msg) flags
+           if not silent
+             then do newFlags <- grabMessageAttribute FetchAttrFlags msg
+                     seqnr <- uidToSequenceNumber uid
+                     sendFetchResponse seqnr newFlags
+             else return ()
+  in do sequence_ $ map doOne uids
+        sendResponseOk tag [] "UID STORE complete"
            
+expunge :: ImapServer Bool
+expunge =
+  do msgs <- ImapServer $ \state -> return $ Right (state, iss_messages state)
+     mbox' <- ImapServer $ \state -> return $ Right (state, iss_selected_mbox state)
+     case mbox' of
+       Nothing -> return False
+       Just mbox ->
+         do toDelete <- foldM (\acc msg ->
+                                case msg of
+                                  Left _ -> return acc
+                                  Right msg' ->
+                                    do flg <- liftServer $ readIORef $ msg_deleted msg'
+                                       trace ((show $ msg_uid msg') ++ " deleted = " ++ (show flg)) $
+                                         if flg
+                                         then do seqnr <- uidToSequenceNumber $ msg_uid msg'
+                                                 return $ (seqnr, msg_uid msg'):acc
+                                         else return acc)
+                        []
+                        msgs
+            mboxAttr <- trace ("Going to delete " ++ (show toDelete)) $ findAttribute "harbinger.mailbox"
+            let worker acc ((MsgSequenceNumber seqNr), uid) =
+                  if not acc
+                  then return False
+                  else do _ <- dbQuery
+                               "DELETE FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ? AND Value = ?"
+                               [uid, mboxAttr, DS.SQLText mbox]
+                          ImapServer $ \state ->
+                            return $ Right (state { iss_messages = flip filter (iss_messages state) $
+                                                                   \x ->
+                                                                   case x of
+                                                                     Left y -> y /= uid
+                                                                     Right y -> msg_uid y /= uid},
+                                            ())
+                          sendResponse ResponseUntagged ResponseStateNone [] $
+                            (show seqNr) ++ " EXPUNGE"
+                          return True
+            foldM worker True toDelete
+                                   
+
+
 processCommand :: Either String (ResponseTag, ImapCommand) -> ImapServer ()
 processCommand (Left err) =
   trace ("Failed: " ++ err) $ sendResponseBad ResponseUntagged [] $ "Failed: " ++ err
@@ -530,12 +598,12 @@ processCommand (Right (tag, cmd)) =
                    let sqlMbox = DS.SQLText $ DT.pack mailbox
                        countByFlag flagAttr =
                          dbQuery "SELECT COUNT(*) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1" [mboxAttr, sqlMbox, flagAttr]
-                   uids <- liftM (map $ unpackMsgUid . head) $ dbQuery "SELECT DISTINCT MessageId FROM MessageAttrs WHERE AttributeId = ? AND Value = ?" [mboxAttr, sqlMbox]
+                   uids <- liftM (map head) $ dbQuery "SELECT DISTINCT MessageId FROM MessageAttrs WHERE AttributeId = ? AND Value = ?" [mboxAttr, sqlMbox]
                    sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length uids) ++ " EXISTS"
                    recent <- countByFlag recentAttr
                    sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length recent) ++ " RECENT"
                    sendResponse ResponseUntagged ResponseStateNone [] "FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\Recent)"
-                   seen <- liftM (sort . map (unpackMsgUid . head)) $ dbQuery "SELECT attr1.MessageId FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1 ORDER BY attr1.MessageId" [mboxAttr, sqlMbox, seenAttr]
+                   seen <- liftM (sortUids . map head) $ dbQuery "SELECT attr1.MessageId FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1 ORDER BY attr1.MessageId" [mboxAttr, sqlMbox, seenAttr]
                    case seen of
                      [] -> return ()
                      (x:_) -> case elemIndex x uids of
@@ -549,7 +617,8 @@ processCommand (Right (tag, cmd)) =
                      _ -> error $ "NextMessageId query produced unexpected result " ++ (show nextUid)
                    sendResponse ResponseUntagged ResponseStateNone [] "OK [PERMANENTFLAGS ()]"
                    sendResponseOk tag [ResponseAttribute "READ-WRITE"] "SELECT completed"
-                   ImapServer $ \state -> return $ Right (state {iss_uids = uids}, ())
+                   ImapServer $ \state -> return $ Right (state {iss_messages = map Left uids,
+                                                                 iss_selected_mbox = Just $ DT.pack mailbox}, ())
     ImapFetch sequenceNumbers attributes ->
       do sequence_ $ map (fetchMessage attributes) sequenceNumbers
          sendResponseOk tag [] "FETCH completed"
@@ -558,30 +627,47 @@ processCommand (Right (tag, cmd)) =
          sendResponseOk tag [] "UID FETCH complete"
     ImapStoreUid uids mode silent flags ->
       storeUids tag mode silent flags uids
+    ImapExpunge -> do r <- expunge
+                      if r
+                        then sendResponseOk tag [] "EXPUNGE complete"
+                        else sendResponseBad tag [] "EXPUNGE failed"
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
-loadMessage :: MsgSequenceNumber -> ImapServer Email
+loadMessage :: MsgSequenceNumber -> ImapServer Message
 loadMessage (MsgSequenceNumber seqNr) = ImapServer $ \state ->
-  let uids = iss_uids state
-  in if seqNr <= 0 || seqNr > length uids
-     then return $ Left $ ImapStopFailed $ "invalid message sequence number " ++ (show seqNr) ++ "; max " ++ (show $ length uids)
-     else run_is (loadMessageByUid $ uids !! (seqNr - 1)) state
+  let messages = iss_messages state
+  in if seqNr <= 0 || seqNr > length messages
+     then return $ Left $ ImapStopFailed $ "invalid message sequence number " ++ (show seqNr) ++ "; max " ++ (show $ 1 + length messages)
+     else case messages !! (seqNr - 1) of
+       Left l -> run_is (loadMessageByUid l) state
+       Right r -> return $ Right (state, r)
 
 liftServer :: IO a -> ImapServer a
 liftServer what = ImapServer $ \state ->
   do r <- what
      return $ Right $ (,) state r
 
-loadMessageByUid :: MsgUid -> ImapServer Email
-loadMessageByUid uu@(MsgUid uid) =
-  do pathQ <- dbQuery "SELECT Location FROM Messages WHERE MessageId = ?" [DS.SQLInteger uid]
+loadMessageByUid :: MsgUid -> ImapServer Message
+loadMessageByUid uid =
+  do pathQ <- dbQuery "SELECT Location FROM Messages WHERE MessageId = ?" [uid]
      let path = case pathQ of
            [[DS.SQLText pth]] -> DT.unpack pth
            _ -> error $ "Unexpected message path " ++ (show pathQ) ++ " for UID " ++ (show uid)
      content <- liftServer $ BS.readFile path
-     case runErrorable $ parseEmail uu content of
+     case runErrorable $ parseEmail content of
        Left errs -> error $ "Cannot parse " ++ path ++ " which is already in the database? (" ++ (show errs) ++ ")"
-       Right res -> return res
+       Right eml ->
+         do deleted <- liftServer $ newIORef False
+            let r = Message { msg_email = eml,
+                              msg_deleted = deleted,
+                              msg_uid = uid }
+            ImapServer $ \state ->
+              return $ Right (state { iss_messages = flip map (iss_messages state) $
+                                                     \x -> case x of
+                                                       Left u | u == uid -> Right r
+                                                       Right rr | uid == msg_uid rr -> Right r
+                                                       _ -> x},
+                              r)
 
 {- Grab a message header, including both the header name and the value components. -}
 extractMessageHeaderFull :: String -> Email -> Maybe String
@@ -623,7 +709,8 @@ renderQuotedString :: String -> String
 renderQuotedString x = "\"" ++ x ++ "\""
 
 uidToByteString :: MsgUid -> BS.ByteString
-uidToByteString (MsgUid i) = stringToByteString $ show i
+uidToByteString (DS.SQLInteger i) = stringToByteString $ show i
+uidToByteString a = error $ "non-integer uid " ++ (show a)
 
 attributeId :: String -> ImapServer DS.SQLData
 attributeId name = ImapServer $ \state ->
@@ -633,12 +720,17 @@ attributeId name = ImapServer $ \state ->
                     id
                     (lookup name $ iss_attributes state))
   
-fetchMessageFlag :: Email -> String -> ImapServer Bool
-fetchMessageFlag eml flagName =
-  let uid = eml_uid eml in
+fetchMessageFlag :: MessageFlag -> Message -> ImapServer Bool
+fetchMessageFlag MessageFlagSeen = fetchSimpleFlag "harbinger.seen"
+fetchMessageFlag MessageFlagRecent = fetchSimpleFlag "harbinger.recent"
+fetchMessageFlag MessageFlagDeleted = liftServer . readIORef . msg_deleted
+
+fetchSimpleFlag :: String -> Message -> ImapServer Bool
+fetchSimpleFlag flagName eml =
+  let uid = msg_uid eml in
   do attrId <- attributeId flagName
      q <- dbQuery "SELECT Value FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ?"
-          [packMsgUid uid, attrId]
+          [uid, attrId]
      return $
        foldr (\entry acc ->
                case entry of
@@ -649,65 +741,66 @@ fetchMessageFlag eml flagName =
        False
        q
 
-clearFlag :: Email -> String -> ImapServer ()
-clearFlag eml flagName =
-  let uid = eml_uid eml in
+clearFlag :: MessageFlag -> Message -> ImapServer ()
+clearFlag MessageFlagSeen eml = clearSimpleFlag "harbinger.seen" eml
+clearFlag MessageFlagRecent eml = clearSimpleFlag "harbinger.recent" eml
+clearFlag MessageFlagDeleted eml =
+  liftServer $ writeIORef (msg_deleted eml) False
+  
+clearSimpleFlag :: String -> Message -> ImapServer ()
+clearSimpleFlag flagName eml =
+  let uid = msg_uid eml in
   do attrId <- attributeId flagName
      ignore $
        dbQuery
        "DELETE FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ?"
-       [packMsgUid uid, attrId]
+       [uid, attrId]
        
-setFlag :: Email -> String -> ImapServer ()
-setFlag eml flagName =
-  let uid = eml_uid eml in
-  do attrId <- attributeId flagName
+setFlag :: MessageFlag -> Message -> ImapServer ()
+setFlag MessageFlagSeen eml =
+  let uid = msg_uid eml in
+  do attrId <- attributeId "harbinger.seen"
      ignore $
        dbQuery
        "UPDATE MessageAttrs SET Value = 1 WHERE MessageId = ? AND AttributeId = ?"
-       [packMsgUid uid, attrId]
+       [uid, attrId]
      nrChanges <- ImapServer $ \state ->
        do r <- DS.changes $ iss_database state
           return $ Right (state, r)
      if nrChanges == 0
-       then ignore $ dbQuery "INSERT INTO MessageAttrs (MessageId, AttributeId, Value) VALUES (?, ?, 1)" [packMsgUid uid, attrId]
+       then ignore $ dbQuery "INSERT INTO MessageAttrs (MessageId, AttributeId, Value) VALUES (?, ?, 1)" [uid, attrId]
        else return ()
-
-grabMessageAttribute :: FetchAttribute -> Email -> ImapServer [(String, BS.ByteString)]
+setFlag MessageFlagRecent _ = ImapServer $ \_ -> return $ Left $ ImapStopFailed "Cannot set recent flag"
+setFlag MessageFlagDeleted eml =
+  liftServer $ writeIORef (msg_deleted eml) True
+  
+grabMessageAttribute :: FetchAttribute -> Message -> ImapServer [(String, BS.ByteString)]
 grabMessageAttribute attr msg =
   case attr of
-    FetchAttrUid -> return [("UID", uidToByteString $ eml_uid msg)]
+    FetchAttrUid -> return [("UID", uidToByteString $ msg_uid msg)]
     FetchAttrFlags ->
-      do seen <- fetchMessageFlag msg "harbinger.seen"
-         recent <- fetchMessageFlag msg "harbinger.recent"
-         let r = if recent
-                 then (:) "\\Recent"
-                 else id
-             s = if seen
-                 then (:) "\\Seen"
-                 else id
-             flags = r $ s []
+      do flags <- liftM (map (msgFlagName . fst) . filter snd) $ mapM (\flg -> liftM ((,) flg) $ fetchMessageFlag flg msg) allMessageFlags
          return [("FLAGS", stringToByteString $ "(" ++ (intercalate " " flags) ++ ")")]
     FetchAttrInternalDate ->
-      return $ case extractMessageHeader "date" msg of
+      return $ case extractMessageHeader "date" (msg_email msg) of
         Nothing -> []
         Just v -> [("INTERNALDATE", stringToByteString $ renderQuotedString v)]
-    FetchAttrRfc822Size -> return [("RFC822.SIZE", stringToByteString $ show $ BS.length $ eml_body msg)]
+    FetchAttrRfc822Size -> return [("RFC822.SIZE", stringToByteString $ show $ BS.length $ eml_body $ msg_email msg)]
     FetchAttrBody peek sectionspec byterange ->
-      do clearFlag msg "harbinger.recent"
+      do clearFlag MessageFlagRecent msg
          if not peek
-           then setFlag msg "harbinger.seen"
+           then setFlag MessageFlagSeen msg
            else return ()
          case (sectionspec, byterange) of
            ((Just (SectionMsgHeaderFields invert headers)), Nothing) ->
              return [("BODY",
-                      stringToByteString $ "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers msg) ++ "\r\n")]
+                      stringToByteString $ "BODY[HEADER.FIELDS (" ++ (intercalate " " headers) ++ ")] " ++ (renderLiteralString $ extractMessageHeaders invert headers $ msg_email msg) ++ "\r\n")]
            (Nothing, Nothing) ->
-             return [("UID", uidToByteString $ eml_uid msg),
-                     ("BODY[]", renderLiteralByteString $ extractFullMessage msg)]
+             return [("UID", uidToByteString $ msg_uid msg),
+                     ("BODY[]", renderLiteralByteString $ extractFullMessage $ msg_email msg)]
       
-sendFetchResponse :: Show a => a -> [(String, BS.ByteString)] -> ImapServer ()
-sendFetchResponse nr attributes =
+sendFetchResponse :: MsgSequenceNumber -> [(String, BS.ByteString)] -> ImapServer ()
+sendFetchResponse (MsgSequenceNumber nr) attributes =
   let res = concatMap (\(a, b) -> [stringToByteString a,b]) attributes in
   sendResponseBs ResponseUntagged ResponseStateNone [] $
   BS.concat [stringToByteString $ show nr,
@@ -716,16 +809,17 @@ sendFetchResponse nr attributes =
              stringToByteString ")"]
   
 fetchMessage :: [FetchAttribute] -> MsgSequenceNumber -> ImapServer ()
-fetchMessage attrs seqNr@(MsgSequenceNumber i) =
+fetchMessage attrs seqNr =
   do msg <- loadMessage seqNr
      results <- liftM concat $ mapM (flip grabMessageAttribute msg) attrs
-     sendFetchResponse i results
+     sendFetchResponse seqNr results
 
 fetchMessageUid :: [FetchAttribute] -> MsgUid -> ImapServer ()
-fetchMessageUid attrs uid@(MsgUid i) =
+fetchMessageUid attrs uid =
   do msg <- loadMessageByUid uid
      results <- liftM concat $ mapM (flip grabMessageAttribute msg) attrs
-     sendFetchResponse i results
+     seqnr <- uidToSequenceNumber uid
+     sendFetchResponse seqnr results
   
 untilError :: ImapServer a -> ImapServer a
 untilError server = ImapServer $ \state ->
