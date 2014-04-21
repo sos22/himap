@@ -159,6 +159,7 @@ data ImapCommand = ImapNoop
                  | ImapStoreUid [MsgUid] (Maybe Bool) Bool [MessageFlag]
                  | ImapExpunge
                  | ImapClose
+                 | ImapLogout
                  | ImapCommandBad String
                    deriving Show
      
@@ -357,6 +358,7 @@ readCommand =
         commandParsers = [("NOOP", return ImapNoop),
                           ("EXPUNGE", return ImapExpunge),
                           ("CLOSE", return ImapClose),
+                          ("LOGOUT", return ImapLogout),
                           ("CAPABILITY", return ImapCapability),
                           ("LOGIN", do requireChar ' '
                                        username <- parseAstring
@@ -641,6 +643,9 @@ processCommand (Right (tag, cmd)) =
                                                                      ())
                               sendResponseOk tag [] "CLOSE complete"
                       else sendResponseBad tag [] "CLOSE failed"
+    ImapLogout -> do sendResponse ResponseUntagged ResponseStateNone [] "BYE Logging out"
+                     sendResponseOk tag [] "LOGOUT"
+                     ImapServer $ \_ -> return $ Left ImapStopFinished
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
 loadMessage :: MsgSequenceNumber -> ImapServer Message
