@@ -19,32 +19,26 @@ data Email = Email { eml_headers :: [Header],
 parseAscii7 :: [Word8] -> String
 parseAscii7 = map $ chr . fromInteger . toInteger
 
-{- Nothing represents newlines -}
-findNewlines :: BS.ByteString -> [(Maybe Word8, BS.ByteString)]
-findNewlines bsl =
-  let tl = BS.tail bsl
-      hd = BS.head bsl
-      hdtl = BS.head tl
-      tltl = BS.tail tl
-  in if BS.null bsl
-     then []
-     else if hd == 10
-          then (Nothing, tl):(findNewlines tl)
-          else if BS.null tl || hd /= 13 || hdtl /= 10
-               then (Just hd, tl):(findNewlines tl)
-               else (Nothing, tltl):(findNewlines tltl)
-
+{- Map from a bytestring to a list of (line, cont) pairs, where the
+cont is the entire contents of the bytestring after that line. -}
 lines :: BS.ByteString -> [([Word8], BS.ByteString)]
 lines s =
-  let worker :: [Word8] -> [(Maybe Word8, BS.ByteString)] -> [([Word8], BS.ByteString)]
-      worker fromPrevNewline remainder =
-        case remainder of
-          [] -> [(fromPrevNewline, BS.empty)]
-          ((Nothing, trailer):rest) ->
-            (fromPrevNewline, trailer):(worker [] rest)
-          ((Just c, _):rest) ->
-            worker (fromPrevNewline ++ [c]) rest
-  in worker [] $ findNewlines s
+  let splitIdx searchFrom =
+        if searchFrom > BS.length s
+        then Nothing
+        else if BS.index s searchFrom == 10
+             then Just (searchFrom, searchFrom + 1)
+             else if searchFrom + 1 < BS.length s &&
+                     BS.index s searchFrom == 13 &&
+                     BS.index s (searchFrom + 1) == 10
+                  then Just (searchFrom, searchFrom + 2)
+                  else splitIdx $ searchFrom + 1
+  in case splitIdx 0 of
+    Nothing -> [(BS.unpack s, BS.empty)]
+    Just (endline, startnext) ->
+      let (a, b) = BS.splitAt endline s
+          (_, d) = BS.splitAt (startnext - endline) b
+      in (BS.unpack a, d):(Email.lines d)
 
 headersBody :: BS.ByteString -> Errorable ([String], BS.ByteString)
 headersBody s =

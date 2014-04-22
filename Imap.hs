@@ -659,8 +659,7 @@ loadMessage (MsgSequenceNumber seqNr) = ImapServer $ \state ->
 
 liftServer :: IO a -> ImapServer a
 liftServer what = ImapServer $ \state ->
-  do r <- what
-     return $ Right $ (,) state r
+  liftM (Right . (,) state) what
 
 loadMessageByUid :: MsgUid -> ImapServer Message
 loadMessageByUid uid =
