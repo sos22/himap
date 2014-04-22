@@ -663,25 +663,35 @@ liftServer what = ImapServer $ \state ->
 
 loadMessageByUid :: MsgUid -> ImapServer Message
 loadMessageByUid uid =
-  do pathQ <- dbQuery "SELECT Location FROM Messages WHERE MessageId = ?" [uid]
-     let path = case pathQ of
-           [[DS.SQLText pth]] -> DT.unpack pth
-           _ -> error $ "Unexpected message path " ++ (show pathQ) ++ " for UID " ++ (show uid)
-     content <- liftServer $ BS.readFile path
-     case runErrorable $ parseEmail content of
-       Left errs -> error $ "Cannot parse " ++ path ++ " which is already in the database? (" ++ (show errs) ++ ")"
-       Right eml ->
-         do deleted <- liftServer $ newIORef False
-            let r = Message { msg_email = eml,
-                              msg_deleted = deleted,
-                              msg_uid = uid }
-            ImapServer $ \state ->
-              return $ Right (state { iss_messages = flip map (iss_messages state) $
-                                                     \x -> case x of
-                                                       Left u | u == uid -> Right r
-                                                       Right rr | uid == msg_uid rr -> Right r
-                                                       _ -> x},
-                              r)
+  do cached <- ImapServer $ \state ->
+       return $ Right (state,
+                       flip find (iss_messages state) $ \entry ->
+                       case entry of
+                         Left _ -> False
+                         Right x | uid == msg_uid x -> True
+                         _ -> False)
+     case cached of
+       Just (Right r) -> return r
+       _ ->
+         do pathQ <- dbQuery "SELECT Location FROM Messages WHERE MessageId = ?" [uid]
+            let path = case pathQ of
+                  [[DS.SQLText pth]] -> DT.unpack pth
+                  _ -> error $ "Unexpected message path " ++ (show pathQ) ++ " for UID " ++ (show uid)
+            content <- liftServer $ BS.readFile path
+            case runErrorable $ parseEmail content of
+              Left errs -> error $ "Cannot parse " ++ path ++ " which is already in the database? (" ++ (show errs) ++ ")"
+              Right eml ->
+                do deleted <- liftServer $ newIORef False
+                   let r = Message { msg_email = eml,
+                                     msg_deleted = deleted,
+                                     msg_uid = uid }
+                   ImapServer $ \state ->
+                     return $ Right (state { iss_messages = flip map (iss_messages state) $
+                                                            \x -> case x of
+                                                              Left u | u == uid -> Right r
+                                                              Right rr | uid == msg_uid rr -> Right r
+                                                              _ -> x},
+                                     r)
 
 {- Grab a message header, including both the header name and the value components. -}
 extractMessageHeaderFull :: String -> Email -> Maybe String
