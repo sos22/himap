@@ -40,7 +40,8 @@ data ImapServerState = ImapServerState { iss_handle :: Handle,
                                          iss_messages :: [Either MsgUid Message],
                                          iss_database :: DS.Database,
                                          iss_attributes :: [(String, DS.SQLData)],
-                                         iss_selected_mbox :: Maybe DT.Text
+                                         iss_selected_mbox :: Maybe DT.Text,
+                                         iss_mailboxes :: [DT.Text]
                                          }
 
 data MessageFlag = MessageFlagSeen
@@ -77,12 +78,21 @@ loadAttributes =
              [attribId, DS.SQLText description] -> (DT.unpack description, attribId)
              _ -> error $ "Bad attribute definition " ++ (show r)
      ImapServer $ \state -> return $ Right (state {iss_attributes = attribs'}, ())
+
+loadMailboxList :: ImapServer ()
+loadMailboxList =
+  do mailboxes <- dbQuery "SELECT Name FROM MailBoxes" []
+     let mboxes = flip map mailboxes $ \r ->
+           case r of
+             [DS.SQLText name] -> name
+             _ -> error $ "Bad mailbox definition " ++ (show r)
+     ImapServer $ \state -> return $ Right (state {iss_mailboxes = mboxes}, ())
      
 runImapServer :: Handle -> ImapServer () -> IO ()
 runImapServer hndle is =
   do inbuf <- newIORef BS.empty
      database <- DS.open $ DT.pack "harbinger.db"
-     ignore $ run_is (loadAttributes >> is) $
+     ignore $ run_is (loadAttributes >> loadMailboxList >> is) $
        ImapServerState { iss_handle = hndle, 
                          iss_outgoing_response = [],
                          iss_inbuf = inbuf, 
@@ -90,7 +100,8 @@ runImapServer hndle is =
                          iss_messages = [], 
                          iss_database = database, 
                          iss_selected_mbox = Nothing,
-                         iss_attributes = error "failed to load attributes DB?"}
+                         iss_attributes = error "failed to load attributes DB?",
+                         iss_mailboxes = error "failed to load mailbox list"}
 
 queueResponseBs :: BS.ByteString -> ImapServer ()
 queueResponseBs what = ImapServer $ \state ->
@@ -486,7 +497,13 @@ readCommand =
 
 
 checkValidMbox :: String -> ImapServer Bool
-checkValidMbox _ = return True -- UNIMPLEMENTED
+checkValidMbox name =
+  let name' = map toLower name in
+  ImapServer $ \state ->
+  return $ Right $ ((,) state) $
+  case find ((==) name' . (map toLower . DT.unpack)) $ iss_mailboxes state of
+    Nothing -> False
+    Just _ -> True
 
 findAttribute :: String -> ImapServer DS.SQLData
 findAttribute name =
@@ -576,6 +593,26 @@ expunge sendUntagged =
                           return True
             foldM worker True toDelete
 
+imapPatternCheck :: String -> String -> Bool
+imapPatternCheck "" "" = True
+imapPatternCheck "" _ = False
+imapPatternCheck (p:ps) string =
+  if p `elem` "%*"
+  then or $ map (imapPatternCheck ps) $ tails string
+  else case string of
+    (s:ss) | p == s -> imapPatternCheck ps ss
+    _ -> False
+    
+imapListCommand :: ResponseTag -> String -> String -> ImapServer Bool
+imapListCommand _ "" pattern =
+  do res <- ImapServer $ \state -> return $ Right (state,
+                                                   filter (imapPatternCheck pattern . DT.unpack) $ iss_mailboxes state)
+     flip mapM_ res $ \mbox ->
+       sendResponse ResponseUntagged ResponseStateNone [] $ "LIST (\\NoInferiors) \"\" " ++ (renderQuotedString $ DT.unpack mbox)
+     return True
+imapListCommand tag _ _ =
+  do sendResponseBad tag [] "LIST bad mailbox or reference"
+     return False
 
 processCommand :: Either String (ResponseTag, ImapCommand) -> ImapServer ()
 processCommand (Left err) =
@@ -589,10 +626,10 @@ processCommand (Right (tag, cmd)) =
     ImapLogin username password -> trace ("login as " ++ username ++ ", password " ++ password) $
                                    sendResponseOk tag [] "Logged in"
     ImapList reference mailbox ->
-      if reference /= "" || (not $ mailbox `elem` ["", "INBOX"])
-      then sendResponseBad tag [] "LIST bad mailbox or reference"
-      else do sendResponse ResponseUntagged ResponseStateNone [] "LIST () \"/\" \"INBOX\""
-              sendResponseOk tag [] "LIST completed"
+      do r <- imapListCommand tag reference mailbox
+         if r
+           then sendResponseOk tag [] "LIST completed"
+           else return ()
     ImapSelect mailbox ->
       do isValidMbox <- checkValidMbox mailbox
          if not isValidMbox

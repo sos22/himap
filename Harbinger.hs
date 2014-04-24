@@ -208,6 +208,8 @@ initialiseDatabase db =
                "CREATE TABLE Messages (MessageId INTEGER PRIMARY KEY NOT NULL, Location TEXT NOT NULL)",
                "CREATE TABLE Attributes (AttributeId INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, Description TEXT NOT NULL)",
                "CREATE TABLE MessageAttrs (MessageId REFERENCES Messages(MessageId) NOT NULL, AttributeId REFERENCES Attributes(AttributeId) NOT NULL, Value NOT NULL)",
+               "CREATE TABLE MailBoxes (Name STRING UNIQUE)",
+               "INSERT INTO MailBoxes (Name) VALUES (\"INBOX\")",
                "CREATE UNIQUE INDEX AttributeRmap ON Attributes (Description)",
                "CREATE INDEX AttrRmap ON MessageAttrs (AttributeId, Value)",
                "INSERT INTO Attributes (Description) VALUES ('rfc822.Message-Id')",
