@@ -48,6 +48,19 @@ readCountedBytes x =
      c' <- readCountedBytes (x - 1)
      return $ c:c'
 
+readCountedByteString :: Int -> ImapRequestParser BS.ByteString
+readCountedByteString amt = ImapRequestParser worker
+  where worker state =
+          do inbuf <- readIORef $ iss_inbuf state
+             if amt + iss_inbuf_idx state >= BS.length inbuf
+               then do nextChunk <- BS.hGetSome (iss_handle state) (amt - iss_inbuf_idx state)
+                       if BS.length nextChunk == 0
+                         then return $ Left ImapStopBacktrack
+                         else do modifyIORef (iss_inbuf state) (flip BS.append nextChunk)
+                                 worker state
+               else return $ Right (state {iss_inbuf_idx = amt + iss_inbuf_idx state},
+                                    BS.take amt $ BS.drop (iss_inbuf_idx state) inbuf)
+
 readCountedChars :: Int -> ImapRequestParser String
 readCountedChars n = liftM (map (chr.fromInteger.toInteger)) $ readCountedBytes n
 
@@ -88,6 +101,16 @@ skipToEOL = do c <- readChar
                                      then state1
                                      else liftM ((:) c) skipToEOL
                                           
+{- I don't understand what IMAP continuations are for, other than
+adding an unnecessary RTT and making everything more of a pain to
+implement.  There's an equivalent protocol which is like IMAP except
+that the client never waits for continuations and the server never
+sends them, and that protocol is, as far as I can tell, strictly
+superior, but since some clients depend on receiving continuations at
+certain times we have to be able to send them. -}
+sendContinuation :: ImapRequestParser ()
+sendContinuation = ImapRequestParser $ run_is $ (queueResponse "+ Go ahead\r\n") >> finishResponse
+  
 readCommand :: ImapRequestParser (ResponseTag, ImapCommand)
 readCommand =
   do t <- liftM ResponseTagged readTag
@@ -135,7 +158,13 @@ readCommand =
         parseLiteral = do requireChar '{'
                           cnt <- parseNumber
                           requireString "}\r\n"
+                          sendContinuation
                           readCountedChars cnt
+        parseLiteralByteString = do requireChar '{'
+                                    cnt <- parseNumber
+                                    requireString "}\r\n"
+                                    sendContinuation
+                                    readCountedByteString cnt
         parseMany1 what = do r <- what
                              alternates [do res <- parseMany1 what
                                             return $ r:res,
@@ -213,7 +242,17 @@ readCommand =
                                          requireString " ("
                                          flags <- parseMany1Sep (requireString " ") parseStatusItem
                                          requireChar ')'
-                                         return $ ImapStatus mbox flags)]
+                                         return $ ImapStatus mbox flags),
+                          ("APPEND ", do mbox <- parseMailbox
+                                         flags <- liftM (maybe [] id) $ optional $ do requireString " ("
+                                                                                      r <- parseManySep (requireString " ") parseFlag
+                                                                                      requireChar ')'
+                                                                                      return r
+                                         datetime <- optional $ do requireChar ' '
+                                                                   parseQuoted
+                                         requireChar ' '
+                                         msg <- parseLiteralByteString
+                                         return $ ImapAppend mbox flags datetime msg)]
         parseFetchAttributes = alternates [do requireString "ALL"
                                               return [FetchAttrFlags,
                                                       FetchAttrInternalDate,

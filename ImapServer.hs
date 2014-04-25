@@ -12,19 +12,25 @@ module ImapServer(ImapServerState(..),
                   MsgUid,
                   ImapServer(..),
                   msgFlagName,
+                  msgFlagDbName,
                   allMessageFlags,
                   StatusItem(..),
                   allStatusItems,
-                  statusItemName
+                  statusItemName,
+                  queueResponse,
+                  queueResponseBs,
+                  finishResponse
                   ) where
 
 import qualified Data.ByteString as BS
 import Data.IORef
 import qualified Data.Text as DT
 import qualified Database.SQLite3 as DS
+import Debug.Trace
 import System.IO
 
 import Email
+import Util
 
 type MsgUid = DS.SQLData
 
@@ -102,6 +108,10 @@ msgFlagName :: MessageFlag -> String
 msgFlagName MessageFlagSeen = "\\Seen"
 msgFlagName MessageFlagRecent = "\\Recent"
 msgFlagName MessageFlagDeleted = "\\Deleted"
+msgFlagDbName :: MessageFlag -> String
+msgFlagDbName MessageFlagSeen = "harbinger.seen"
+msgFlagDbName MessageFlagRecent = "harbinger.recent"
+msgFlagDbName MessageFlagDeleted = error "cannot set deleted flag in database"
 
 data StatusItem = StatusItemMessages
                 | StatusItemRecent
@@ -131,8 +141,26 @@ data ImapCommand = ImapNoop
                  | ImapFetchUid [MsgUid] [FetchAttribute]
                  | ImapStoreUid [MsgUid] (Maybe Bool) Bool [MessageFlag]
                  | ImapStatus String [StatusItem]
+                 | ImapAppend String [MessageFlag] (Maybe String) BS.ByteString
                  | ImapExpunge
                  | ImapClose
                  | ImapLogout
                  | ImapCommandBad String
                    deriving Show
+
+queueResponseBs :: BS.ByteString -> ImapServer ()
+queueResponseBs what = ImapServer $ \state ->
+  return $ Right (state {iss_outgoing_response = what:(iss_outgoing_response state)},
+                  ())
+  
+queueResponse :: String -> ImapServer ()
+queueResponse = queueResponseBs . stringToByteString
+
+finishResponse :: ImapServer ()
+finishResponse = ImapServer $ \isState ->
+  let worker [] = return ()
+      worker (x:xs) = worker xs >> ((trace $ "sending " ++ (byteStringToString x)) $ BS.hPut (iss_handle isState) x)
+  in do worker (iss_outgoing_response isState)
+        hFlush (iss_handle isState)
+        return $ Right (isState {iss_outgoing_response = []}, ())
+

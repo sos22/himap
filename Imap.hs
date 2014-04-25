@@ -12,6 +12,7 @@ import qualified Database.SQLite3 as DS
 import qualified Data.Text as DT
 import qualified Data.ByteString as BS
 
+import Deliver
 import Email
 import Util
 
@@ -58,22 +59,6 @@ runImapServer hndle is =
                          iss_selected_mbox = Nothing,
                          iss_attributes = error "failed to load attributes DB?",
                          iss_mailboxes = error "failed to load mailbox list"}
-
-queueResponseBs :: BS.ByteString -> ImapServer ()
-queueResponseBs what = ImapServer $ \state ->
-  return $ Right (state {iss_outgoing_response = what:(iss_outgoing_response state)},
-                  ())
-  
-queueResponse :: String -> ImapServer ()
-queueResponse = queueResponseBs . stringToByteString
-
-finishResponse :: ImapServer ()
-finishResponse = ImapServer $ \isState ->
-  let worker [] = return ()
-      worker (x:xs) = worker xs >> ((trace $ "sending " ++ (byteStringToString x)) $ BS.hPut (iss_handle isState) x)
-  in do worker (iss_outgoing_response isState)
-        hFlush (iss_handle isState)
-        return $ Right (isState {iss_outgoing_response = []}, ())
 
 data ResponseState = ResponseStateOk
                    | ResponseStateNo
@@ -366,6 +351,18 @@ processCommand (Right (tag, cmd)) =
     ImapLogout -> do sendResponse ResponseUntagged ResponseStateNone [] "BYE Logging out"
                      sendResponseOk tag [] "LOGOUT"
                      ImapServer $ \_ -> return $ Left ImapStopFinished
+    ImapAppend mailbox flags datetime body ->
+      do valid <- checkValidMbox mailbox
+         if not valid
+           then sendResponseBad tag [] "APPEND bad mailbox"
+           else
+           case runErrorable $ parseEmail body of
+             Left _ -> sendResponseBad tag [] "APPEND bad message"
+             Right parsed ->
+               do ImapServer $ \state ->
+                    do fileEmail mailbox flags (iss_database state) (iss_attributes state) parsed
+                       return $ Right (state, ())
+                  sendResponseOk tag [] "APPEND complete"
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
 loadMessage :: MsgSequenceNumber -> ImapServer Message
