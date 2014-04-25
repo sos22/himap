@@ -1,4 +1,5 @@
-module ImapParser where
+module ImapParser(ImapRequestParser(run_irp),
+                  readCommand) where
 
 import Control.Monad
 import qualified Data.ByteString as BS
