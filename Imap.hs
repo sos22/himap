@@ -4,6 +4,7 @@ import Control.Concurrent
 import Control.Exception
 import Control.Monad
 import Data.Char
+import Data.Int
 import Data.IORef
 import Data.List
 import Debug.Trace
@@ -248,6 +249,53 @@ imapListCommand tag _ _ =
   do sendResponseBad tag [] "LIST bad mailbox or reference"
      return False
 
+dbQueryInt :: String -> [DS.SQLData] -> ImapServer Int64
+dbQueryInt q params =
+  do res <- dbQuery q params
+     return $ case res of
+       [[DS.SQLInteger i]] -> i
+       _ -> error $ "Expected query " ++ q ++ " to produce an int, got " ++ (show res)
+       
+imapStatus :: ResponseTag -> String -> [StatusItem] -> ImapServer ()
+imapStatus tag mboxName items =
+  let sqlMbox = DS.SQLText $ DT.pack mboxName in
+  do valid <- checkValidMbox mboxName
+     mboxAttr <- findAttribute "harbinger.mailbox"
+     recentAttr <- findAttribute "harbinger.recent"
+     seenAttr <- findAttribute "harbinger.seen"
+     let fromDb what q params = do dbres <- dbQueryInt q params
+                                   return $ (statusItemName what) ++ " " ++ (show dbres)
+         worker StatusItemMessages =
+           fromDb
+           StatusItemMessages
+           "SELECT COUNT(DISTINCT MessageId) FROM MessageAttrs WHERE AttributeId = ? AND Value = ?"
+           [mboxAttr, sqlMbox]
+         worker StatusItemRecent =
+           fromDb
+           StatusItemRecent
+           "SELECT COUNT(DISTINCT attr1.MessageId) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1"
+           [mboxAttr, sqlMbox, recentAttr]
+         worker StatusItemUidNext =
+           fromDb
+           StatusItemUidNext
+           "SELECT Val FROM NextMessageId"
+           []
+         worker StatusItemUidValidity =
+           return "UIDVALIDITY 12345"
+         worker StatusItemUnseen =
+           do seen <- dbQueryInt
+                      "SELECT COUNT(DISTINCT attr1.MessageId) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1"
+                      [mboxAttr, sqlMbox, seenAttr]
+              total <- dbQueryInt
+                       "SELECT COUNT(DISTINCT MessageId) FROM MessageAttrs WHERE AttributeId = ? AND Value = ?"
+                       [mboxAttr, sqlMbox]
+              return $ "UNSEEN " ++ (show $ total - seen)
+     if not valid
+       then sendResponseBad tag [] "STATUS bad mbox"
+       else do items' <- mapM worker items
+               sendResponse ResponseUntagged ResponseStateNone [] $ "STATUS " ++ mboxName ++ " (" ++ (intercalate " " items') ++ ")"
+               sendResponseOk tag [] "STATUS complete"
+       
 processCommand :: Either String (ResponseTag, ImapCommand) -> ImapServer ()
 processCommand (Left err) =
   trace ("Failed: " ++ err) $ sendResponseBad ResponseUntagged [] $ "Failed: " ++ err
@@ -273,7 +321,7 @@ processCommand (Right (tag, cmd)) =
                    seenAttr <- findAttribute "harbinger.seen"
                    let sqlMbox = DS.SQLText $ DT.pack mailbox
                        countByFlag flagAttr =
-                         dbQuery "SELECT COUNT(*) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1" [mboxAttr, sqlMbox, flagAttr]
+                         dbQuery "SELECT COUNT(DISTINCT attr1.MessageId) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1" [mboxAttr, sqlMbox, flagAttr]
                    uids <- liftM (map head) $ dbQuery "SELECT DISTINCT MessageId FROM MessageAttrs WHERE AttributeId = ? AND Value = ?" [mboxAttr, sqlMbox]
                    sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length uids) ++ " EXISTS"
                    recent <- countByFlag recentAttr
@@ -307,6 +355,7 @@ processCommand (Right (tag, cmd)) =
                       if r
                         then sendResponseOk tag [] "EXPUNGE complete"
                         else sendResponseBad tag [] "EXPUNGE failed"
+    ImapStatus mbox items -> imapStatus tag mbox items
     ImapClose -> do r <- expunge False
                     if r
                       then do ImapServer $ \state -> return $ Right (state {iss_selected_mbox = Nothing,

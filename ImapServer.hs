@@ -12,7 +12,10 @@ module ImapServer(ImapServerState(..),
                   MsgUid,
                   ImapServer(..),
                   msgFlagName,
-                  allMessageFlags
+                  allMessageFlags,
+                  StatusItem(..),
+                  allStatusItems,
+                  statusItemName
                   ) where
 
 import qualified Data.ByteString as BS
@@ -95,11 +98,29 @@ data MessageFlag = MessageFlagSeen
                    deriving (Show, Eq)
 allMessageFlags :: [MessageFlag]
 allMessageFlags = [MessageFlagSeen, MessageFlagRecent, MessageFlagDeleted]
-
 msgFlagName :: MessageFlag -> String
 msgFlagName MessageFlagSeen = "\\Seen"
 msgFlagName MessageFlagRecent = "\\Recent"
 msgFlagName MessageFlagDeleted = "\\Deleted"
+
+data StatusItem = StatusItemMessages
+                | StatusItemRecent
+                | StatusItemUidNext
+                | StatusItemUidValidity
+                | StatusItemUnseen
+                  deriving Show
+allStatusItems :: [StatusItem]
+allStatusItems = [StatusItemMessages,
+                  StatusItemRecent,
+                  StatusItemUidNext,
+                  StatusItemUidValidity,
+                  StatusItemUnseen]
+statusItemName :: StatusItem -> String
+statusItemName StatusItemMessages = "MESSAGES"
+statusItemName StatusItemRecent = "RECENT"
+statusItemName StatusItemUidNext = "UIDNEXT"
+statusItemName StatusItemUidValidity = "UIDVALIDITY"
+statusItemName StatusItemUnseen = "UNSEEN"
 
 data ImapCommand = ImapNoop
                  | ImapCapability
@@ -109,6 +130,7 @@ data ImapCommand = ImapNoop
                  | ImapFetch [MsgSequenceNumber] [FetchAttribute]
                  | ImapFetchUid [MsgUid] [FetchAttribute]
                  | ImapStoreUid [MsgUid] (Maybe Bool) Bool [MessageFlag]
+                 | ImapStatus String [StatusItem]
                  | ImapExpunge
                  | ImapClose
                  | ImapLogout

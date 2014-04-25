@@ -208,7 +208,12 @@ readCommand =
                                                                      trace ("C3 " ++ (show r)) $ requireString ")"
                                                                      trace "C4" $ return r,
                                                                   parseMany1Sep (requireString " ") parseFlag ]
-                                            trace ("flags " ++ (show flags)) $ return $ ImapStoreUid uids mode silent flags)]
+                                            return $ ImapStoreUid uids mode silent flags),
+                          ("STATUS ", do mbox <- parseMailbox
+                                         requireString " ("
+                                         flags <- parseMany1Sep (requireString " ") parseStatusItem
+                                         requireChar ')'
+                                         return $ ImapStatus mbox flags)]
         parseFetchAttributes = alternates [do requireString "ALL"
                                               return [FetchAttrFlags,
                                                       FetchAttrInternalDate,
@@ -229,6 +234,7 @@ readCommand =
                                               requireChar ')'
                                               return r,
                                            liftM (\x -> [x]) parseFetchAttr]
+        parseStatusItem = alternates $ flip map allStatusItems (\x -> (requireString $ statusItemName x) >> return x) 
         parseSequenceSet = liftM concat $ parseMany1Sep (requireChar ',') $ do n <- parseSeqNumber
                                                                                alternates [ do requireChar ':'
                                                                                                r <- parseSeqNumber
