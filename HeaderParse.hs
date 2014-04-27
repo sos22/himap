@@ -118,7 +118,8 @@ mailboxList =
 addressList :: Parser [String]
 addressList =
   alternatives [liftM concat $ many1Sep address (char ','),
-                obsAddrList]
+                obsAddrList,
+                return []]
 unstructured :: Parser [String]
 unstructured =
   do r <- many $ do a <- optional fWS
@@ -253,7 +254,7 @@ aText :: Parser Char
 aText =
   alternatives $
   map char
-  "1234567890qwertyuiopasdfghklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM!#$%&\'*+-/=?^_`{|}~"
+  "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM!#$%&\'*+-/=?^_`{|}~"
 atom :: Parser String
 atom =
   do _ <- optional cFWS
@@ -269,6 +270,7 @@ quotedString =
                     return $ case a of
                       Nothing -> b
                       Just _ -> ' ':b
+     _ <- optional fWS
      _ <- char '"'
      _ <- optional cFWS
      return $ concat r
