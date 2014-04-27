@@ -3,7 +3,7 @@ module HeaderParse(parseHeader) where
 
 import Control.Monad
 import Data.Char
-import Data.List
+import Data.List hiding (group)
 import qualified Data.Text as DT
 import qualified Database.SQLite3 as DS
 import Debug.Trace
@@ -21,48 +21,48 @@ instance Monad Parser where
       Left err -> Left err
       Right (res1, c', midStr) -> run_parser (sndF res1) c' midStr
   
-parseAlternatives :: [Parser a] -> Parser a
-parseAlternatives [] = Parser $ \_ _ -> Left "ran out of alternatives"
-parseAlternatives (a:as) = Parser $ \c str ->
+alternatives :: [Parser a] -> Parser a
+alternatives [] = Parser $ \_ _ -> Left "ran out of alternatives"
+alternatives (a:as) = Parser $ \c str ->
   case run_parser a c str of
-    Left _ -> run_parser (parseAlternatives as) c str
+    Left _ -> run_parser (alternatives as) c str
     Right (res, c', leftover) -> Right (res, c', leftover)
 
-parseNonEmpty :: String -> Parser a -> Parser a
-parseNonEmpty msg parser =
+nonEmpty :: String -> Parser a -> Parser a
+nonEmpty msg parser =
   Parser $ \_ initStr ->
   case run_parser parser False initStr of
     Left err -> Left err
-    Right (_, False, "") -> Left "parseNonEmpty empty string at end of file"
+    Right (_, False, "") -> Left "nonEmpty empty string at end of file"
     Right (_, False, leftover) -> Left $ msg ++ " failed to consume any input at " ++ (show initStr) ++ ", leftover " ++ (show leftover)
     Right (res, True, leftover) -> Right (res, True, leftover)
     
-parseMany1 :: Parser a -> Parser [a]
-parseMany1 p =
-  do one <- parseNonEmpty "many1" p
-     rest <- parseAlternatives [parseMany1 p, return []]
+many1 :: Parser a -> Parser [a]
+many1 p =
+  do one <- nonEmpty "many1" p
+     rest <- alternatives [many1 p, return []]
      return $ one:rest
-parseMany :: Parser a -> Parser [a]
-parseMany p = parseAlternatives [parseMany1 p, return []]
-parseMany1Sep :: Parser a -> Parser b -> Parser [a]
-parseMany1Sep thing seperator =
-  parseAlternatives [do one <- parseNonEmpty "many1sep" (do x <- thing
-                                                            _ <- seperator
-                                                            return x)
-                        rest <- parseMany1Sep thing seperator
-                        return $ one:rest,
-                     do one <- parseNonEmpty "many1sep singleton" thing
-                        return [one]]
-parseOptional :: Parser a -> Parser (Maybe a)
-parseOptional what = parseAlternatives [ liftM Just what,
-                                         return Nothing ]
-parseChar :: Char -> Parser Char
-parseChar c = Parser $ \_ x -> case x of
+many :: Parser a -> Parser [a]
+many p = alternatives [many1 p, return []]
+many1Sep :: Parser a -> Parser b -> Parser [a]
+many1Sep thing seperator =
+  alternatives [do one <- nonEmpty "many1sep" (do x <- thing
+                                                  _ <- seperator
+                                                  return x)
+                   rest <- many1Sep thing seperator
+                   return $ one:rest,
+                do one <- nonEmpty "many1sep singleton" thing
+                   return [one]]
+optional :: Parser a -> Parser (Maybe a)
+optional what = alternatives [ liftM Just what,
+                               return Nothing ]
+char :: Char -> Parser Char
+char c = Parser $ \_ x -> case x of
   "" -> Left $ "EOF looking for " ++ [c]
   (cc:ccs) | cc == c -> Right (c, True, ccs)
            | otherwise -> Left $ "Wanted " ++ [c] ++ ", got "++ x
-parseCharRange :: Int -> Int -> Parser Char
-parseCharRange start end = Parser $ \_ x ->
+charRange :: Int -> Int -> Parser Char
+charRange start end = Parser $ \_ x ->
   case x of
     [] -> Left $ "EOF looking for >= " ++ (show start) ++ " <= " ++ (show end)
     xx:xs ->
@@ -81,251 +81,287 @@ runParser p what =
 -- This is a fairly direct transcript of the grammar from RFC2822,
 -- because it's easier to do that than to sit and thinnk about what it
 -- all means.
-parseMsgId :: Parser DS.SQLData
-parseMsgId = do _ <- parseOptional $ parseCFWS
-                _ <- parseChar '<'
-                l <- parseIdLeft
-                _ <- parseChar '@'
-                r <- parseIdRight
-                _ <- parseChar '>'
-                _ <- parseOptional $ parseCFWS
-                return $ DS.SQLText $ DT.pack $ l ++ "@" ++ r
-parseIdLeft :: Parser String
-parseIdLeft = parseAlternatives [parseDotAtomText, parseNoFoldQuote, parseObsIdLeft]
-parseIdRight :: Parser String
-parseIdRight = parseAlternatives [parseDotAtomText, parseNoFoldLiteral, parseObsIdRight]
-parseNoFoldQuote :: Parser String
-parseNoFoldQuote = do _ <- parseChar '"'
-                      _ <- parseOptional $ parseChar '\''
-                      r <- liftM concat $ parseMany (parseAlternatives [liftM singleton parseQtext, parseQuotedPair])
-                      _ <- parseOptional $ parseChar '\''
-                      _ <- parseChar '"'
-                      return r
-parseNoFoldLiteral :: Parser String
-parseNoFoldLiteral = do _ <- parseChar '['
-                        r <- liftM concat $ parseMany (parseAlternatives [liftM singleton parseDtext, parseQuotedPair])
-                        _ <- parseChar ']'
-                        return r
-parseMailboxList :: Parser [String]
-parseMailboxList = parseAlternatives [liftM concat $ parseMany1Sep parseMailbox (parseChar ','),
-                                      parseObsMboxList]
-parseAddressList :: Parser [String]
-parseAddressList = parseAlternatives [liftM concat $ parseMany1Sep parseAddress (parseChar ','),
-                                      parseObsAddrList]
-parseUnstructured :: Parser [String]
-parseUnstructured = do r <- parseMany $ do a <- parseOptional parseFWS
-                                           b <- parseUtext
-                                           return $ case a of
-                                             Nothing -> b
-                                             Just _ -> ' ':b
-                       _ <- parseOptional parseFWS
-                       return [concat r]
-parseUtext :: Parser String
-parseUtext = parseAlternatives [liftM (\x -> [x]) parseNoWsCtl,
-                                liftM (\x -> [x]) $ parseCharRange 33 126,
-                                parseObsUtext]
-parsePhrase :: Parser String
-parsePhrase = parseAlternatives [liftM (intercalate " ") $ parseMany1 parseWord, parseObsPhrase]
-parseWord :: Parser String
-parseWord = parseAlternatives [parseAtom, parseQuotedString]
-parseAddress :: Parser [String]
-parseAddress = parseAlternatives [parseMailbox, parseGroup]
-parseMailbox :: Parser [String]
-parseMailbox = parseAlternatives [parseNameAddr, liftM (\x -> [x]) parseAddrSpec]
-parseNameAddr :: Parser [String]
-parseNameAddr = do dn <- parseOptional parseDisplayName
-                   aa <- parseAngleAddr
-                   return $ case dn of
-                     Just dn' -> [dn',aa]
-                     Nothing -> [aa]
-parseAngleAddr :: Parser String
-parseAngleAddr = parseAlternatives [do _ <- parseOptional parseCFWS
-                                       as <- do _ <- parseChar '<'
-                                                r <- parseAddrSpec
-                                                _ <- parseChar '>'
-                                                return r
-                                       _ <- parseOptional parseCFWS
-                                       return as,
-                                    parseObsAngleAddr]
-parseGroup :: Parser [String]
-parseGroup = do dn <- parseDisplayName
-                _ <- parseChar ':'
-                ml <- parseOptional $ parseAlternatives [parseMailboxList, parseCFWS >> return []]
-                _ <- parseChar ';'
-                _ <- parseOptional parseCFWS
-                return $ case ml of
-                  Just x -> dn:x
-                  Nothing -> [dn]
-parseDisplayName :: Parser String
-parseDisplayName = parsePhrase
-parseAddrSpec :: Parser String
-parseAddrSpec = do l <- parseLocalPart
-                   _ <- parseChar '@'
-                   d <- parseDomain
-                   return $ l ++ "@" ++ d
-parseLocalPart :: Parser String
-parseLocalPart = parseAlternatives [parseDotAtom, parseQuotedString, parseObsLocalPart]
-parseDomain :: Parser String
-parseDomain = parseAlternatives [parseDotAtom, parseDomainLiteral, parseObsDomain]
-parseDomainLiteral :: Parser String
-parseDomainLiteral = do _ <- parseOptional parseCFWS
-                        _ <- parseChar '['
-                        r <- parseMany $ do a <- parseOptional parseFWS
-                                            r <- parseDcontent
-                                            return $ case a of
-                                              Nothing -> r
-                                              Just _ -> ' ':r
-                        _ <- parseOptional parseFWS
-                        _ <- parseChar ']'
-                        _ <- parseOptional parseCFWS
-                        return $ concat r
-parseDcontent :: Parser String
-parseDcontent = parseAlternatives [liftM singleton parseDtext, parseQuotedPair]
-parseDtext :: Parser Char
-parseDtext = parseAlternatives [parseNoWsCtl, parseCharRange 33 90, parseCharRange 94 126]
-parseNoWsCtl :: Parser Char
-parseNoWsCtl = parseAlternatives [parseCharRange 1 8,
-                                  parseCharRange 11 12,
-                                  parseCharRange 14 31,
-                                  parseCharRange 127 127]
+msgId :: Parser DS.SQLData
+msgId = do _ <- optional $ cFWS
+           _ <- char '<'
+           l <- idLeft
+           _ <- char '@'
+           r <- idRight
+           _ <- char '>'
+           _ <- optional $ cFWS
+           return $ DS.SQLText $ DT.pack $ l ++ "@" ++ r
+idLeft :: Parser String
+idLeft = alternatives [dotAtomText, noFoldQuote, obsIdLeft]
+idRight :: Parser String
+idRight = alternatives [dotAtomText, noFoldLiteral, obsIdRight]
+noFoldQuote :: Parser String
+noFoldQuote =
+  do _ <- char '"'
+     _ <- optional $ char '\''
+     r <- liftM concat $
+          many (alternatives [liftM singleton qtext,
+                              quotedPair])
+     _ <- optional $ char '\''
+     _ <- char '"'
+     return r
+noFoldLiteral :: Parser String
+noFoldLiteral =
+  do _ <- char '['
+     r <- liftM concat $
+          many (alternatives [liftM singleton dtext, quotedPair])
+     _ <- char ']'
+     return r
+mailboxList :: Parser [String]
+mailboxList =
+  alternatives [liftM concat $ many1Sep mailbox (char ','),
+                obsMboxList]
+addressList :: Parser [String]
+addressList =
+  alternatives [liftM concat $ many1Sep address (char ','),
+                obsAddrList]
+unstructured :: Parser [String]
+unstructured =
+  do r <- many $ do a <- optional fWS
+                    b <- utext
+                    return $ case a of
+                      Nothing -> b
+                      Just _ -> ' ':b
+     _ <- optional fWS
+     return [concat r]
+utext :: Parser String
+utext =
+  alternatives [liftM (\x -> [x]) noWsCtl,
+                liftM (\x -> [x]) $ charRange 33 126,
+                obsUtext]
+phrase :: Parser String
+phrase =
+  alternatives [liftM (intercalate " ") $ many1 word,
+                obsPhrase]
+word :: Parser String
+word = alternatives [atom, quotedString]
+address :: Parser [String]
+address = alternatives [mailbox, group]
+mailbox :: Parser [String]
+mailbox = alternatives [nameAddr, liftM (\x -> [x]) addrSpec]
+nameAddr :: Parser [String]
+nameAddr =
+  do dn <- optional displayName
+     aa <- angleAddr
+     return $ case dn of
+       Just dn' -> [dn',aa]
+       Nothing -> [aa]
+angleAddr :: Parser String
+angleAddr =
+  alternatives [do _ <- optional cFWS
+                   as <- do _ <- char '<'
+                            r <- addrSpec
+                            _ <- char '>'
+                            return r
+                   _ <- optional cFWS
+                   return as,
+                obsAngleAddr]
+group :: Parser [String]
+group =
+  do dn <- displayName
+     _ <- char ':'
+     ml <- optional $ alternatives [mailboxList, cFWS >> return []]
+     _ <- char ';'
+     _ <- optional cFWS
+     return $ case ml of
+       Just x -> dn:x
+       Nothing -> [dn]
+displayName :: Parser String
+displayName = phrase
+addrSpec :: Parser String
+addrSpec =
+  do l <- localPart
+     _ <- char '@'
+     d <- domain
+     return $ l ++ "@" ++ d
+localPart :: Parser String
+localPart = alternatives [dotAtom, quotedString, obsLocalPart]
+domain :: Parser String
+domain = alternatives [dotAtom, domainLiteral, obsDomain]
+domainLiteral :: Parser String
+domainLiteral =
+  do _ <- optional cFWS
+     _ <- char '['
+     r <- many $ do a <- optional fWS
+                    r <- dcontent
+                    return $ case a of
+                      Nothing -> r
+                      Just _ -> ' ':r
+     _ <- optional fWS
+     _ <- char ']'
+     _ <- optional cFWS
+     return $ concat r
+dcontent :: Parser String
+dcontent = alternatives [liftM singleton dtext, quotedPair]
+dtext :: Parser Char
+dtext = alternatives [noWsCtl, charRange 33 90, charRange 94 126]
+noWsCtl :: Parser Char
+noWsCtl =
+  alternatives [charRange 1 8,
+                charRange 11 12,
+                charRange 14 31,
+                charRange 127 127]
 singleton :: a -> [a]
 singleton x = [x]
-parseText :: Parser String
-parseText = parseAlternatives [liftM singleton $ parseCharRange 1 9,
-                               liftM singleton $ parseCharRange 11 12,
-                               liftM singleton $ parseCharRange 14 127,
-                               parseObsText]
-parseQuotedPair :: Parser String
-parseQuotedPair = parseAlternatives [(parseChar '\\') >> parseText,
-                                     liftM singleton parseObsQp]
-parseFWS :: Parser ()
-parseFWS = parseAlternatives [parseMany1 parseWSP >> return (), parseObsFWS] >> return ()
-parseCFWS :: Parser ()
-parseCFWS = do _ <- parseMany (parseOptional parseFWS >> parseComment)
-               parseAlternatives [(parseOptional parseFWS) >> parseComment,
-                                  parseFWS]
-               return ()
-parseComment :: Parser ()
-parseComment = do _ <- parseChar '('
-                  _ <- parseMany (parseFWS >> parseCContent)
-                  parseFWS
-                  _ <- parseChar ')'
-                  return ()
-parseCContent :: Parser ()
-parseCContent = parseAlternatives [parseCText, parseQuotedPair >> return (), parseComment] >> return ()
-parseCText :: Parser ()
-parseCText = parseAlternatives [parseNoWsCtl,
-                                parseCharRange 33 39,
-                                parseCharRange 41 91,
-                                parseCharRange 93 126] >> return ()
-parseWSP :: Parser ()
-parseWSP = (parseAlternatives $ map parseChar " \r\t\n\v") >> return ()
-parseDotAtom :: Parser String
-parseDotAtom = do _ <- parseOptional parseCFWS
-                  r <- parseDotAtomText
-                  _ <- parseOptional parseCFWS
-                  return r
-parseDotAtomText :: Parser String
-parseDotAtomText = liftM (intercalate ".") $ parseMany1Sep (parseMany1 parseAText) (parseChar '.')
-parseAText :: Parser Char
-parseAText = parseAlternatives $ map parseChar "1234567890qwertyuiopasdfghklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM!#$%&\'*+-/=?^_`{|}~"
-parseAtom :: Parser String
-parseAtom = do _ <- parseOptional parseCFWS
-               r <- parseMany1 parseAText
-               _ <- parseOptional parseCFWS
-               return r
-parseQuotedString :: Parser String
-parseQuotedString = do _ <- parseOptional parseCFWS
-                       _ <- parseChar '"'
-                       r <- parseMany $ do a <- parseOptional parseFWS
-                                           b <- parseQcontent
-                                           return $ case a of
-                                             Nothing -> b
-                                             Just _ -> ' ':b
-                       _ <- parseChar '"'
-                       _ <- parseOptional parseCFWS
-                       return $ concat r
-parseQcontent :: Parser String
-parseQcontent = parseAlternatives [liftM singleton parseQtext, parseQuotedPair]
-parseQtext :: Parser Char
-parseQtext = parseAlternatives [parseNoWsCtl,
-                                parseCharRange 33 33,
-                                parseCharRange 35 91,
-                                parseCharRange 93 126]
-parseObsIdLeft :: Parser String
-parseObsIdLeft = parseLocalPart
-parseObsIdRight :: Parser String
-parseObsIdRight = parseDomain
-parseObsMboxList :: Parser [String]
-parseObsMboxList =
-  do r <- liftM concat $ parseMany1 $ do rr <- parseOptional parseMailbox
-                                         _ <- parseOptional parseCFWS
-                                         _ <- parseChar ','
-                                         _ <- parseOptional parseCFWS
-                                         return $ maybe [] id rr
-     l <- parseOptional parseMailbox
+text :: Parser String
+text =
+  alternatives [liftM singleton $ charRange 1 9,
+                liftM singleton $ charRange 11 12,
+                liftM singleton $ charRange 14 127,
+                obsText]
+quotedPair :: Parser String
+quotedPair =
+  alternatives [(char '\\') >> text,
+                liftM singleton obsQp]
+fWS :: Parser ()
+fWS = alternatives [many1 wSP >> return (), obsFWS] >> return ()
+cFWS :: Parser ()
+cFWS =
+  do _ <- many (optional fWS >> comment)
+     alternatives [(optional fWS) >> comment, fWS]
+     return ()
+comment :: Parser ()
+comment =
+  do _ <- char '('
+     _ <- many (fWS >> cContent)
+     fWS
+     _ <- char ')'
+     return ()
+cContent :: Parser ()
+cContent = alternatives [cText, quotedPair >> return (), comment] >> return ()
+cText :: Parser ()
+cText =
+  alternatives [noWsCtl,
+                charRange 33 39,
+                charRange 41 91,
+                charRange 93 126] >> return ()
+wSP :: Parser ()
+wSP = (alternatives $ map char " \r\t\n\v") >> return ()
+dotAtom :: Parser String
+dotAtom =
+  do _ <- optional cFWS
+     r <- dotAtomText
+     _ <- optional cFWS
+     return r
+dotAtomText :: Parser String
+dotAtomText = liftM (intercalate ".") $ many1Sep (many1 aText) (char '.')
+aText :: Parser Char
+aText =
+  alternatives $
+  map char
+  "1234567890qwertyuiopasdfghklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM!#$%&\'*+-/=?^_`{|}~"
+atom :: Parser String
+atom =
+  do _ <- optional cFWS
+     r <- many1 aText
+     _ <- optional cFWS
+     return r
+quotedString :: Parser String
+quotedString =
+  do _ <- optional cFWS
+     _ <- char '"'
+     r <- many $ do a <- optional fWS
+                    b <- qcontent
+                    return $ case a of
+                      Nothing -> b
+                      Just _ -> ' ':b
+     _ <- char '"'
+     _ <- optional cFWS
+     return $ concat r
+qcontent :: Parser String
+qcontent = alternatives [liftM singleton qtext, quotedPair]
+qtext :: Parser Char
+qtext =
+  alternatives [noWsCtl,
+                charRange 33 33,
+                charRange 35 91,
+                charRange 93 126]
+obsIdLeft :: Parser String
+obsIdLeft = localPart
+obsIdRight :: Parser String
+obsIdRight = domain
+obsMboxList :: Parser [String]
+obsMboxList =
+  do r <- liftM concat $ many1 $ do rr <- optional mailbox
+                                    _ <- optional cFWS
+                                    _ <- char ','
+                                    _ <- optional cFWS
+                                    return $ maybe [] id rr
+     l <- optional mailbox
      return $ case l of
        Nothing -> r
        Just ls -> ls ++ r
-parseObsAddrList :: Parser [String]
-parseObsAddrList = do r <- parseMany1 $ do rr <- parseOptional parseAddress
-                                           _ <- parseOptional parseCFWS
-                                           _ <- parseChar ','
-                                           _ <- parseOptional parseCFWS
-                                           return $ maybe [] id rr
-                      l <- parseOptional parseAddress
-                      return $ (concat r) ++ (maybe [] id l)
-parseObsAngleAddr :: Parser String
-parseObsAngleAddr = do _ <- parseOptional parseCFWS
-                       _ <- parseChar '<'
-                       _ <- parseOptional parseObsRoute
-                       a <- parseAddrSpec
-                       _ <- parseChar '>'
-                       _ <- parseOptional parseCFWS
-                       return a
-parseObsRoute :: Parser String
-parseObsRoute = do _ <- parseOptional parseCFWS
-                   dl <- parseObsDomainList
-                   _ <- parseChar ':'
-                   _ <- parseOptional parseCFWS
-                   return dl
-parseObsDomainList :: Parser String
-parseObsDomainList = do _ <- parseChar '@'
-                        d <- parseDomain
-                        ds <- parseMany $ do _ <- parseMany $ parseAlternatives [parseCFWS, parseChar ',' >> return ()]
-                                             _ <- parseOptional parseCFWS
-                                             _ <- parseChar '@'
-                                             parseDomain
-                        return $ '@':(intercalate "@" (d:ds))
-parseObsDomain :: Parser String
-parseObsDomain = liftM (intercalate ".") $ parseMany1Sep parseAtom (parseChar '.')
-parseObsLocalPart :: Parser String
-parseObsLocalPart = liftM (intercalate ".") $ parseMany1Sep parseWord (parseChar '.')
-parseObsUtext :: Parser String
-parseObsUtext = parseObsText
-parseObsText :: Parser String
-parseObsText = do _ <- parseMany $ parseChar '\r'
-                  _ <- parseMany $ parseChar '\n'
-                  liftM concat $ parseMany $ do rr <- parseObsChar
-                                                a <- parseMany $ parseChar '\r'
-                                                b <- parseMany $ parseChar '\n'
-                                                return $ case (a, b) of
-                                                  ("", "") -> [rr]
-                                                  _ -> rr:" "
-parseObsChar :: Parser Char
-parseObsChar = parseAlternatives [ parseCharRange 0 9,
-                                   parseCharRange 11 12,
-                                   parseCharRange 14 127]
-parseObsPhrase :: Parser String
-parseObsPhrase = do w <- parseWord
-                    r <- parseMany $ parseAlternatives [parseWord,
-                                                        liftM singleton $ parseChar '.',
-                                                        parseCFWS >> return ""]
-                    return $ intercalate " " $ w:r
-parseObsQp :: Parser Char
-parseObsQp = (parseChar '\\') >> parseCharRange 0 127
-parseObsFWS :: Parser ()
-parseObsFWS = (parseMany1 parseWSP) >> (parseMany (parseChar '\r' >> parseChar '\n' >> parseMany1 parseWSP)) >> return ()
+obsAddrList :: Parser [String]
+obsAddrList =
+  do r <- many1 $ do rr <- optional address
+                     _ <- optional cFWS
+                     _ <- char ','
+                     _ <- optional cFWS
+                     return $ maybe [] id rr
+     l <- optional address
+     return $ (concat r) ++ (maybe [] id l)
+obsAngleAddr :: Parser String
+obsAngleAddr =
+  do _ <- optional cFWS
+     _ <- char '<'
+     _ <- optional obsRoute
+     a <- addrSpec
+     _ <- char '>'
+     _ <- optional cFWS
+     return a
+obsRoute :: Parser String
+obsRoute =
+  do _ <- optional cFWS
+     dl <- obsDomainList
+     _ <- char ':'
+     _ <- optional cFWS
+     return dl
+obsDomainList :: Parser String
+obsDomainList =
+  do _ <- char '@'
+     d <- domain
+     ds <- many $ do _ <- many $ alternatives [cFWS, char ',' >> return ()]
+                     _ <- optional cFWS
+                     _ <- char '@'
+                     domain
+     return $ '@':(intercalate "@" (d:ds))
+obsDomain :: Parser String
+obsDomain = liftM (intercalate ".") $ many1Sep atom (char '.')
+obsLocalPart :: Parser String
+obsLocalPart = liftM (intercalate ".") $ many1Sep word (char '.')
+obsUtext :: Parser String
+obsUtext = obsText
+obsText :: Parser String
+obsText =
+  do _ <- many $ char '\r'
+     _ <- many $ char '\n'
+     liftM concat $ many $ do rr <- obsChar
+                              a <- many $ char '\r'
+                              b <- many $ char '\n'
+                              return $ case (a, b) of
+                                ("", "") -> [rr]
+                                _ -> rr:" "
+obsChar :: Parser Char
+obsChar =
+  alternatives [ charRange 0 9,
+                 charRange 11 12,
+                 charRange 14 127]
+obsPhrase :: Parser String
+obsPhrase =
+  do w <- word
+     r <- many $ alternatives [word,
+                               liftM singleton $ char '.',
+                               cFWS >> return ""]
+     return $ intercalate " " $ w:r
+obsQp :: Parser Char
+obsQp = (char '\\') >> charRange 0 127
+obsFWS :: Parser ()
+obsFWS =
+  (many1 wSP) >> (many (char '\r' >> char '\n' >> many1 wSP)) >> return ()
 
 stringField :: Parser [String] -> Parser [DS.SQLData]
 stringField = liftM (map $ DS.SQLText . DT.pack)
@@ -333,18 +369,19 @@ stringField = liftM (map $ DS.SQLText . DT.pack)
 -- mapping from RFC822 header name to (attribute name, attribute
 -- parser) pairs.
 parsers :: [(String, (String, Parser [DS.SQLData]))]
-parsers = [("in-reply-to", ("rfc822.In-Reply-To", parseMany1 parseMsgId)),
-           ("references", ("rfc822.References", parseMany1 parseMsgId)),
-           ("from", ("rfc822.From", stringField parseMailboxList)),
-           ("sender", ("rfc822.Sender", stringField parseAddressList)),
-           ("reply-to", ("rfc822.Reply-To", stringField parseAddressList)),
-           ("to", ("rfc822.To", stringField parseAddressList)),
-           ("cc", ("rfc822.Cc", stringField parseAddressList)),
-           ("bcc", ("rfc822.Bcc", stringField parseAddressList)),
-           ("subject", ("rfc822.Subject", stringField parseUnstructured)),
-           ("comments", ("rfc822.Comments", stringField parseUnstructured)),
-           ("keywords", ("rfc822.Keywords", stringField $ parseMany1Sep parsePhrase (parseChar ','))),
-           ("date", ("rfc822.Date", stringField $ parseUnstructured))]
+parsers = [("in-reply-to", ("rfc822.In-Reply-To", many1 msgId)),
+           ("references", ("rfc822.References", many1 msgId)),
+           ("from", ("rfc822.From", stringField mailboxList)),
+           ("sender", ("rfc822.Sender", stringField addressList)),
+           ("reply-to", ("rfc822.Reply-To", stringField addressList)),
+           ("to", ("rfc822.To", stringField addressList)),
+           ("cc", ("rfc822.Cc", stringField addressList)),
+           ("bcc", ("rfc822.Bcc", stringField addressList)),
+           ("subject", ("rfc822.Subject", stringField unstructured)),
+           ("comments", ("rfc822.Comments", stringField unstructured)),
+           ("keywords", ("rfc822.Keywords",
+                         stringField $ many1Sep phrase (char ','))),
+           ("date", ("rfc822.Date", stringField $ unstructured))]
 
 parseHeader :: Header -> Either String [(String, DS.SQLData)]
 parseHeader (Header name value) =
