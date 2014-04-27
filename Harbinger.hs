@@ -4,6 +4,7 @@ import qualified Data.ByteString as BS
 import qualified Database.SQLite3 as DS
 import qualified Data.Text as DT
 import Control.Exception.Base
+import System.Exit
 
 import Deliver
 import Email
@@ -97,5 +98,9 @@ main =
      case (runErrorable . parseEmail) content of
        Left errs -> do print $ byteStringToString content
                        putStrLn $ "Failed: " ++ (show errs) ++ "\n"
-       Right parsed' -> fileEmail "INBOX" [] database attribs parsed'
+       Right parsed' ->
+         do success <- fileEmail "INBOX" [] database attribs parsed'
+            if success
+              then exitSuccess
+              else exitFailure
 

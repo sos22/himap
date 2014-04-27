@@ -359,10 +359,12 @@ processCommand (Right (tag, cmd)) =
            case runErrorable $ parseEmail body of
              Left _ -> sendResponseBad tag [] "APPEND bad message"
              Right parsed ->
-               do ImapServer $ \state ->
-                    do fileEmail mailbox flags (iss_database state) (iss_attributes state) parsed
-                       return $ Right (state, ())
-                  sendResponseOk tag [] "APPEND complete"
+               do success <- ImapServer $ \state ->
+                    do s <- fileEmail mailbox flags (iss_database state) (iss_attributes state) parsed
+                       return $ Right (state, s)
+                  if success
+                    then sendResponseOk tag [] "APPEND complete"
+                    else sendResponseBad tag [] "APPEND failed"
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
 loadMessage :: MsgSequenceNumber -> ImapServer Message
