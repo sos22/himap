@@ -228,7 +228,7 @@ parseDotAtom = do _ <- parseOptional parseCFWS
 parseDotAtomText :: Parser String
 parseDotAtomText = liftM (intercalate ".") $ parseMany1Sep (parseMany1 parseAText) (parseChar '.')
 parseAText :: Parser Char
-parseAText = parseAlternatives $ map parseChar "1234567890qwertyuiopasdfghklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM!#$%&\'*+-/=?`{|}~"
+parseAText = parseAlternatives $ map parseChar "1234567890qwertyuiopasdfghklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM!#$%&\'*+-/=?^_`{|}~"
 parseAtom :: Parser String
 parseAtom = do _ <- parseOptional parseCFWS
                r <- parseMany1 parseAText
