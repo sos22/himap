@@ -22,3 +22,13 @@ do
     cursor=$(($cursor + 1))
     echo $cursor > import/cursor
 done
+
+if [ -s import/failed ]
+then
+    echo "Some imports failed; list in import/failed"
+    exit 1
+else
+    echo "Import successful"
+    rm -r import
+    exit 0
+fi
