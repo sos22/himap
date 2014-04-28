@@ -228,8 +228,8 @@ cFWS =
 comment :: Parser ()
 comment =
   do _ <- char '('
-     _ <- many (fWS >> cContent)
-     fWS
+     _ <- many ((optional fWS) >> cContent)
+     _ <- optional fWS
      _ <- char ')'
      return ()
 cContent :: Parser ()
@@ -238,7 +238,7 @@ cText :: Parser ()
 cText =
   alternatives [noWsCtl,
                 charRange 33 39,
-                charRange 41 91,
+                charRange 42 91,
                 charRange 93 126] >> return ()
 wSP :: Parser ()
 wSP = (alternatives $ map char " \r\t\n\v") >> return ()
