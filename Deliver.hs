@@ -181,21 +181,24 @@ fileEmail mailbox flags database attribs eml =
      createSymbolicLink ("../../../" ++ poolFile') dateSymlinkPath
      msgDbId <- allocMsgDbId database
      journalWrite j $ JournalRegisterMessage msgId msgDbId
-     addDbRow database "Messages" [DS.SQLInteger msgDbId, DS.SQLText $ DT.pack poolFile']
-     addAttribute database attribs msgDbId "rfc822.Message-Id" (DS.SQLText $ DT.pack msgId)
-     failed <- liftM or $ flip mapM (eml_headers eml'') $ \header ->
-       case parseHeader header of
-         Left err -> hPutStrLn stderr err >> return True
-         Right dbattribs ->
-           (flip mapM_ dbattribs $ \(tableName, value) ->
-             addAttribute database attribs msgDbId tableName value) >> return False
+     failed <- transactional database $
+       do addDbRow database "Messages" [DS.SQLInteger msgDbId, DS.SQLText $ DT.pack poolFile']
+          addAttribute database attribs msgDbId "rfc822.Message-Id" (DS.SQLText $ DT.pack msgId)
+          failed <- liftM or $ flip mapM (eml_headers eml'') $ \header ->
+            case parseHeader header of
+              Left err -> hPutStrLn stderr err >> return True
+              Right dbattribs ->
+                (flip mapM_ dbattribs $ \(tableName, value) ->
+                  addAttribute database attribs msgDbId tableName value) >> return False
+          if failed
+            then hPutStrLn stderr "failed to add message to index"
+            else do flip mapM_ (MessageFlagRecent:flags) $ \flag ->
+                      addAttribute database attribs msgDbId (msgFlagDbName flag) (DS.SQLInteger 1)
+                    addAttribute database attribs msgDbId "harbinger.mailbox" (DS.SQLText $ DT.pack mailbox)
+          return failed
      if failed
-       then do hPutStrLn stderr "failed to add message to index"
-               return False
-       else do flip mapM_ (MessageFlagRecent:flags) $ \flag ->
-                 addAttribute database attribs msgDbId (msgFlagDbName flag) (DS.SQLInteger 1)
-               addAttribute database attribs msgDbId "harbinger.mailbox" (DS.SQLText $ DT.pack mailbox)
-               hClose $ journal_handle j
+       then return False
+       else do hClose $ journal_handle j
                {- XXX Need to do an fsync here XXX -}
                removeFile $ journal_path j
                return True
