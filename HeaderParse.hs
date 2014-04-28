@@ -371,8 +371,10 @@ stringField = liftM (map $ DS.SQLText . DT.pack)
 -- mapping from RFC822 header name to (attribute name, attribute
 -- parser) pairs.
 parsers :: [(String, (String, Parser [DS.SQLData]))]
-parsers = [("in-reply-to", ("rfc822.In-Reply-To", many1 msgId)),
-           ("references", ("rfc822.References", many1 msgId)),
+parsers = [("in-reply-to", ("rfc822.In-Reply-To", many msgId)),
+           {- references is supposed to be space-separated, but some
+              clients use commas.  Tolerate that -}
+           ("references", ("rfc822.References", many1Sep msgId (optional $ char ','))),
            ("from", ("rfc822.From", stringField mailboxList)),
            ("sender", ("rfc822.Sender", stringField addressList)),
            ("reply-to", ("rfc822.Reply-To", stringField addressList)),
