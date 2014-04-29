@@ -38,6 +38,8 @@ many1 p =
   do one <- nonEmpty p
      rest <- alternatives [many1 p, return []]
      return $ one:rest
+many1greedy :: Parser a -> Parser [a]
+many1greedy p = (many1 p) `notFollowedBy` p
 many :: Parser a -> Parser [a]
 many p = alternatives [many1 p, return []]
 many1Sep :: Parser a -> Parser b -> Parser [a]
@@ -53,6 +55,22 @@ manySep :: Parser a -> Parser b -> Parser [a]
 manySep thing seperator =
   alternatives [many1Sep thing seperator, return []]
                 
+followedBy :: Parser a -> Parser b -> Parser a
+followedBy a b =
+  do r <- a
+     _ <- b
+     return r
+
+{- invert a is a parser which matches iff a does not -}
+invert :: Parser a -> Parser ()
+invert p = Parser $ \c str ->
+  case run_parser p False str of
+    [] -> [((), c, str)]
+    _ -> []
+
+notFollowedBy :: Parser a -> Parser b -> Parser a
+notFollowedBy a b = a `followedBy` (invert b)
+
 optional :: Parser a -> Parser (Maybe a)
 optional what = alternatives [ return Nothing,
                                liftM Just what ]
@@ -105,14 +123,15 @@ runParser p what =
 -- This is a fairly direct transcript of the grammar from RFC2822,
 -- because it's easier to do that than to sit and thinnk about what it
 -- all means.
-msgId :: Parser DS.SQLData
+msgId :: Parser [DS.SQLData]
 msgId =
-  alternatives [do _ <- char '<'
+  alternatives [do descr <- liftM (maybe [] singleton) $ optional $ phrase `followedBy` skipCFWS
+                   _ <- char '<'
                    l <- many1Sep (alternatives [noFoldQuote, noFoldLiteral, localPart, domainLiteral]) (char '@')
                    _ <- char '>'
-                   return $ DS.SQLText $ DT.pack $ intercalate "@" l,
+                   return $ map (DS.SQLText . DT.pack) $ descr ++ [intercalate "@" l],
                 do l <- many1Sep (alternatives [noFoldQuote, noFoldLiteral, localPart, domainLiteral]) (char '@')
-                   return $ DS.SQLText $ DT.pack $ intercalate "@" l]
+                   return [DS.SQLText $ DT.pack $ intercalate "@" l]]
 noFoldQuote :: Parser String
 noFoldQuote =
   do _ <- char '"'
@@ -225,7 +244,7 @@ quotedPair :: Parser String
 quotedPair =
   liftM singleton obsQp
 fWS :: Parser ()
-fWS = many1 wSP >> return ()
+fWS = many1greedy wSP >> return ()
 cFWS :: Parser ()
 cFWS = (many1 $ alternatives [comment, fWS]) >> return ()
 comment :: Parser ()
@@ -315,23 +334,28 @@ obsChar =
 phrase :: Parser String
 phrase =
   liftM (intercalate " ") $
-  many1Sep (alternatives [many1 (alternatives [aText, char '.']), quotedString]) cFWS
+  many1Sep (alternatives [(many1greedy (alternatives [aText, char '.', char ',', char ':'])),
+                          quotedString]) cFWS
 obsQp :: Parser Char
 obsQp = (char '\\') >> charRange 0 127
 
 stringField :: Parser [String] -> Parser [DS.SQLData]
 stringField = liftM (map $ DS.SQLText . DT.pack)
 
+inReplyToParser :: Parser [DS.SQLData]
+inReplyToParser =
+  stripCFWS $ alternatives [liftM concat $ manySep msgId skipCFWS,
+                            do _ <- char '<'
+                               _ <- char '>'
+                               return [] ]
+  
 -- mapping from RFC822 header name to (attribute name, attribute
 -- parser) pairs.
 parsers :: [(String, (String, Parser [DS.SQLData]))]
-parsers = [("in-reply-to", ("rfc822.In-Reply-To", stripCFWS $ alternatives [manySep msgId skipCFWS,
-                                                                            do _ <- char '<'
-                                                                               _ <- char '>'
-                                                                               return [] ])),
+parsers = [("in-reply-to", ("rfc822.In-Reply-To", inReplyToParser)),
            {- references is supposed to be space-separated, but some
               clients use commas.  Tolerate that -}
-           ("references", ("rfc822.References", stripCFWS $ manySep msgId (stripCFWS $ optional $ char ','))),
+           ("references", ("rfc822.References", stripCFWS $ liftM concat $ manySep msgId (stripCFWS $ optional $ char ','))),
            ("from", ("rfc822.From", stringField mailboxList)),
            ("sender", ("rfc822.Sender", stringField addressList)),
            ("reply-to", ("rfc822.Reply-To", stringField addressList)),
@@ -346,6 +370,7 @@ parsers = [("in-reply-to", ("rfc822.In-Reply-To", stripCFWS $ alternatives [many
 
 parseHeader :: Header -> Either String [(String, DS.SQLData)]
 parseHeader (Header name value) =
+  trace ("Parse " ++ name ++ " ---> " ++ (show value)) $
   case lookup (map toLower name) parsers of
     Just (fieldname, parser) ->
       case runParser parser value of
