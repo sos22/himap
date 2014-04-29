@@ -173,7 +173,7 @@ utext =
                 liftM (\x -> [x]) $ charRange 33 126,
                 obsUtext]
 address :: Parser [String]
-address = alternatives [mailbox, group]
+address = alternatives [mailbox, group, liftM singleton phrase]
 mailbox :: Parser [String]
 mailbox = alternatives [nameAddr, liftM (\x -> [x]) addrSpec]
 nameAddr :: Parser [String]
@@ -334,7 +334,7 @@ obsChar =
 phrase :: Parser String
 phrase =
   liftM (intercalate " ") $
-  many1Sep (alternatives [(many1greedy (alternatives [aText, char '.', char ',', char ':'])),
+  many1Sep (alternatives [(many1greedy (alternatives [aText, char '.', char ',', char ':', char ';'])),
                           quotedString]) cFWS
 obsQp :: Parser Char
 obsQp = (char '\\') >> charRange 0 127
@@ -370,9 +370,9 @@ parsers = [("in-reply-to", ("rfc822.In-Reply-To", inReplyToParser)),
 
 parseHeader :: Header -> Either String [(String, DS.SQLData)]
 parseHeader (Header name value) =
-  trace ("Parse " ++ name ++ " ---> " ++ (show value)) $
   case lookup (map toLower name) parsers of
     Just (fieldname, parser) ->
+      trace ("Parse " ++ name ++ " ---> " ++ (show value)) $
       case runParser parser value of
         Nothing -> Left $ "cannot parse header " ++ name ++ ", value " ++ (show value)
         Just val -> Right $ [(fieldname, v) | v <- val]
