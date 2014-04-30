@@ -12,17 +12,22 @@ import Email
 
 {- Less a parser and more a canonicaliser.  Maps from strings (usually
    header values) to lists of things under which the message should be indexed. -}
-data Parser a = Parser { run_parser :: Bool -> String -> [(a, Bool, String)] }
+data ParserState = ParserState {ps_consumed :: Bool,
+                                ps_rest :: String }
+                   deriving Show
+data Parser a = Parser {
+  run_parser :: ParserState -> [(a, ParserState)]
+  }
 
 instance Monad Parser where
-  return x = Parser $ \c r -> [(x, c, r)]
-  fstM >>= sndF = Parser $ \c initialStr ->
-    do (res1, consumed1, leftover1) <- run_parser fstM c initialStr
-       run_parser (sndF res1) consumed1 leftover1
+  return x = Parser $ \s -> [(x, s)]
+  fstM >>= sndF = Parser $ \state ->
+    do (res1, state') <- run_parser fstM state
+       run_parser (sndF res1) state'
   
 alternatives :: [Parser a] -> Parser a
-alternatives opts = Parser $ \c str ->
-  flip concatMap opts $ \o -> run_parser o c str
+alternatives opts = Parser $ \state ->
+  flip concatMap opts $ \o -> run_parser o state
 
 demaybe :: [Maybe a] -> [a]
 demaybe [] = []
@@ -31,7 +36,8 @@ demaybe ((Just x):xs) = x:(demaybe xs)
 
 nonEmpty :: Parser a -> Parser a
 nonEmpty parser =
-  Parser $ \_ initStr -> filter (\(_, x, _) -> x) $ run_parser parser False initStr
+  Parser $ \state -> filter (ps_consumed . snd) $
+                     run_parser parser (state {ps_consumed = False})
          
 many1 :: Parser a -> Parser [a]
 many1 p =
@@ -63,9 +69,9 @@ followedBy a b =
 
 {- invert a is a parser which matches iff a does not -}
 invert :: Parser a -> Parser ()
-invert p = Parser $ \c str ->
-  case run_parser p False str of
-    [] -> [((), c, str)]
+invert p = Parser $ \state ->
+  case run_parser p state of
+    [] -> [((), state)]
     _ -> []
 
 notFollowedBy :: Parser a -> Parser b -> Parser a
@@ -75,23 +81,28 @@ optional :: Parser a -> Parser (Maybe a)
 optional what = alternatives [ return Nothing,
                                liftM Just what ]
 char :: Char -> Parser Char
-char c = Parser $ \_ x -> case x of
-  "" -> []
-  (cc:ccs) | cc == c -> [(c, True, ccs)]
-           | otherwise -> []
+char c =
+  Parser $ \state -> case ps_rest state of
+    "" -> []
+    (cc:ccs) | cc == c -> [(c, ParserState {ps_consumed = True,
+                                            ps_rest = ccs})]
+             | otherwise -> []
 charRange :: Int -> Int -> Parser Char
-charRange start end = Parser $ \_ x ->
-  case x of
+charRange start end =
+  Parser $ \state ->
+  case ps_rest state of
     [] -> []
     xx:xs ->
       if ord xx >= start && ord xx <= end
-      then [(xx, True, xs)]
+      then [(xx, ParserState {ps_consumed = True,
+                              ps_rest = xs})]
       else []
 
 eof :: Parser ()
-eof = Parser $ \c x -> case x of
-  "" -> [((), c, "")]
-  _ -> []
+eof =
+  Parser $ \state -> case ps_rest state of
+    "" -> [((), state)]
+    _ -> []
 
 skipCFWS :: Parser ()
 skipCFWS = liftM (const ()) $ optional cFWS
@@ -111,13 +122,12 @@ stripFWS p =
      return r
 runParser :: Show a => Parser a -> String -> Maybe a
 runParser p what =
-  let p' = do pp <- p
-              eof
-              return pp
+  let p' = p `followedBy` eof
   in
-  case run_parser p' False what of
-    ((x, _, ""):_) -> trace (what ++ " -> " ++ (show x)) $
-                      Just x
+  case run_parser p' (ParserState {ps_consumed = False, 
+                                   ps_rest = what}) of
+    ((x, _):_) -> trace (what ++ " -> " ++ (show x)) $
+                  Just x
     _ -> Nothing
 
 -- This is a fairly direct transcript of the grammar from RFC2822,
