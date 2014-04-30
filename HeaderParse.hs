@@ -126,9 +126,9 @@ runParser p what =
 msgId :: Parser [DS.SQLData]
 msgId =
   alternatives [do descr <- liftM (maybe [] singleton) $ optional $ phrase `followedBy` skipCFWS
-                   _ <- char '<'
+                   _ <- many1greedy $ char '<'
                    l <- many1Sep (alternatives [noFoldQuote, noFoldLiteral, localPart, domainLiteral]) (char '@')
-                   _ <- char '>'
+                   _ <- many1greedy $ char '>'
                    return $ map (DS.SQLText . DT.pack) $ descr ++ [intercalate "@" l],
                 do l <- many1Sep (alternatives [noFoldQuote, noFoldLiteral, localPart, domainLiteral]) (char '@')
                    return [DS.SQLText $ DT.pack $ intercalate "@" l]]
@@ -334,7 +334,7 @@ obsChar =
 phrase :: Parser String
 phrase =
   liftM (intercalate " ") $
-  many1Sep (alternatives [(many1greedy (alternatives [aText, char '.', char ',', char ':', char ';'])),
+  many1Sep (alternatives [(many1greedy (alternatives [aText, char '.', char ',', char ':', char ';', char '@'])),
                           quotedString]) cFWS
 obsQp :: Parser Char
 obsQp = (char '\\') >> charRange 0 127
