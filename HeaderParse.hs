@@ -13,7 +13,8 @@ import Email
 {- Less a parser and more a canonicaliser.  Maps from strings (usually
    header values) to lists of things under which the message should be indexed. -}
 data ParserState = ParserState {ps_consumed :: Bool,
-                                ps_rest :: String }
+                                ps_rest :: String, 
+                                ps_dropspace :: Bool}
                    deriving Show
 data Parser a = Parser {
   run_parser :: ParserState -> [(a, ParserState)]
@@ -67,6 +68,14 @@ followedBy a b =
      _ <- b
      return r
 
+skipSpace :: Parser a -> Parser a
+skipSpace p =
+  do oldDrop <- Parser $ \state -> [(ps_dropspace state,
+                                     state {ps_dropspace = True})]
+     r <- p
+     Parser $ \state -> [((), state {ps_dropspace = oldDrop})]
+     return r
+     
 {- invert a is a parser which matches iff a does not -}
 invert :: Parser a -> Parser ()
 invert p = Parser $ \state ->
@@ -82,21 +91,31 @@ optional what = alternatives [ return Nothing,
                                liftM Just what ]
 char :: Char -> Parser Char
 char c =
-  Parser $ \state -> case ps_rest state of
+  Parser $ \state ->
+  case ps_rest state of
     "" -> []
-    (cc:ccs) | cc == c -> [(c, ParserState {ps_consumed = True,
-                                            ps_rest = ccs})]
-             | otherwise -> []
+    (cc:ccs) ->
+      let nextState = state {ps_consumed = True,
+                             ps_rest = ccs}
+      in if cc `elem` " \r\t\n\f\v" && ps_dropspace state
+         then run_parser (char c) nextState
+         else if cc == c
+              then [(c, nextState)]
+              else []
 charRange :: Int -> Int -> Parser Char
 charRange start end =
   Parser $ \state ->
   case ps_rest state of
     [] -> []
     xx:xs ->
-      if ord xx >= start && ord xx <= end
-      then [(xx, ParserState {ps_consumed = True,
-                              ps_rest = xs})]
-      else []
+      let nextState = state {ps_consumed = True,
+                             ps_rest = xs}
+      in if xx `elem` " \r\t\n\f\v" && ps_dropspace state
+         then run_parser (charRange start end) nextState
+         else      
+           if ord xx >= start && ord xx <= end
+           then [(xx, nextState)]
+           else []
 
 eof :: Parser ()
 eof =
@@ -125,7 +144,8 @@ runParser p what =
   let p' = p `followedBy` eof
   in
   case run_parser p' (ParserState {ps_consumed = False, 
-                                   ps_rest = what}) of
+                                   ps_rest = what,
+                                   ps_dropspace = False}) of
     ((x, _):_) -> trace (what ++ " -> " ++ (show x)) $
                   Just x
     _ -> Nothing
@@ -137,8 +157,8 @@ msgId :: Parser [DS.SQLData]
 msgId =
   alternatives [do descr <- liftM (maybe [] singleton) $ optional $ phrase `followedBy` skipCFWS
                    _ <- many1greedy $ char '<'
-                   l <- many1Sep (alternatives [noFoldQuote, noFoldLiteral, localPart, domainLiteral]) (char '@')
-                   _ <- many1greedy $ char '>'
+                   l <- skipSpace $ many1Sep (alternatives [noFoldQuote, noFoldLiteral, localPart, domainLiteral]) (char '@')
+                   _ <- skipSpace $ many1greedy $ char '>'
                    return $ map (DS.SQLText . DT.pack) $ descr ++ [intercalate "@" l],
                 do l <- many1Sep (alternatives [noFoldQuote, noFoldLiteral, localPart, domainLiteral]) (char '@')
                    return [DS.SQLText $ DT.pack $ intercalate "@" l]]
@@ -359,13 +379,17 @@ inReplyToParser =
                                _ <- char '>'
                                return [] ]
   
+{- references is supposed to be space-separated, but some
+   clients use commas.  Tolerate that -}
+referencesParser :: Parser [DS.SQLData]
+referencesParser =
+  stripCFWS $ liftM concat $ manySep msgId (stripCFWS $ optional $ char ',')
+  
 -- mapping from RFC822 header name to (attribute name, attribute
 -- parser) pairs.
 parsers :: [(String, (String, Parser [DS.SQLData]))]
 parsers = [("in-reply-to", ("rfc822.In-Reply-To", inReplyToParser)),
-           {- references is supposed to be space-separated, but some
-              clients use commas.  Tolerate that -}
-           ("references", ("rfc822.References", stripCFWS $ liftM concat $ manySep msgId (stripCFWS $ optional $ char ','))),
+           ("references", ("rfc822.References", referencesParser)),
            ("from", ("rfc822.From", stringField mailboxList)),
            ("sender", ("rfc822.Sender", stringField addressList)),
            ("reply-to", ("rfc822.Reply-To", stringField addressList)),
