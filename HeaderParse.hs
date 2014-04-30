@@ -230,6 +230,7 @@ group =
        Nothing -> [dn]
 addrSpec :: Parser String
 addrSpec =
+  skipSpace $
   stripCFWS $
   do l <- localPart
      _ <- stripCFWS $ char '@'
@@ -243,7 +244,11 @@ localPart =
 atom :: Parser String
 atom = many1 aText
 dotAtomText :: Parser String
-dotAtomText = liftM (intercalate ".") $ many1Sep atom (stripCFWS $ char '.')
+dotAtomText =
+  let sep = (many1 $ alternatives $ map char ".:;-")
+  in liftM (intercalate ".") $ do r <- many1Sep atom (stripCFWS sep)
+                                  _ <- optional sep
+                                  return r
 
 domain :: Parser String
 domain = alternatives [domainLiteral, dotAtomText]
