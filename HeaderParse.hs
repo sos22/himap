@@ -146,7 +146,7 @@ runParser p what =
   case run_parser p' (ParserState {ps_consumed = False, 
                                    ps_rest = what,
                                    ps_dropspace = False}) of
-    ((x, _):_) -> trace (what ++ " -> " ++ (show x)) $
+    ((x, _):_) -> trace ((show what) ++ " -> " ++ (show x)) $
                   Just x
     _ -> Nothing
 
@@ -245,7 +245,7 @@ atom :: Parser String
 atom = many1 aText
 dotAtomText :: Parser String
 dotAtomText =
-  let sep = (many1 $ alternatives $ map char ".:;-,")
+  let sep = (many1 $ alternatives $ map char ".:;,")
   in liftM (intercalate ".") $ do r <- many1Sep atom (stripCFWS sep)
                                   _ <- optional sep
                                   return r
