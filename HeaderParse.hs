@@ -245,7 +245,7 @@ atom :: Parser String
 atom = many1 aText
 dotAtomText :: Parser String
 dotAtomText =
-  let sep = (many1 $ alternatives $ map char ".:;-")
+  let sep = (many1 $ alternatives $ map char ".:;-,")
   in liftM (intercalate ".") $ do r <- many1Sep atom (stripCFWS sep)
                                   _ <- optional sep
                                   return r
@@ -379,7 +379,7 @@ stringField = liftM (map $ DS.SQLText . DT.pack)
 
 inReplyToParser :: Parser [DS.SQLData]
 inReplyToParser =
-  stripCFWS $ alternatives [liftM concat $ manySep msgId skipCFWS,
+  stripCFWS $ alternatives [liftM concat $ manySep msgId (nonEmpty skipCFWS),
                             do _ <- char '<'
                                _ <- char '>'
                                return [] ]
