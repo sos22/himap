@@ -1,7 +1,12 @@
 {- Thing to get headers into a canonical format for the database index. -}
 module HeaderParse(parseHeader) where
 
+import qualified Codec.Text.IConv as IC
+import qualified Codec.Binary.Base64 as Base64
+import qualified Codec.Binary.QuotedPrintable as QuotedPrintable
 import Control.Monad
+import qualified Data.ByteString as DB
+import qualified Data.ByteString.Lazy as DBL
 import Data.Char
 import Data.List hiding (group)
 import qualified Data.Text as DT
@@ -29,6 +34,10 @@ instance Monad Parser where
 alternatives :: [Parser a] -> Parser a
 alternatives opts = Parser $ \state ->
   flip concatMap opts $ \o -> run_parser o state
+
+alternatives' :: [(Parser a, b)] -> Parser b
+alternatives' opts =
+  alternatives $ map (\(o,r) -> o >> return r) opts
 
 demaybe :: [Maybe a] -> [a]
 demaybe [] = []
@@ -139,12 +148,62 @@ stripFWS p =
      r <- p
      skipFWS
      return r
+
+deEncode :: String -> String
+deEncode "" = ""
+deEncode ('=':'?':ss) =
+  let token = many1 tokenChar
+      sToBS :: String -> DB.ByteString
+      sToBS = DB.pack . map (fromInteger . toInteger . ord)
+      bsToS :: DB.ByteString -> String
+      bsToS = map (chr . fromInteger . toInteger) . DB.unpack
+      decodeBase64 :: String -> String
+      decodeBase64 what =
+        case Base64.decode $ sToBS what of
+          Left _ -> what
+          Right x -> bsToS x
+      decodeQuotedPrintable what =
+        case QuotedPrintable.decode $ sToBS what of
+          Left _ -> what
+          Right x -> bsToS x
+      tokenChar = alternatives [charRange 33 33,
+                                charRange 35 39,
+                                charRange 42 43,
+                                charRange 45 45,
+                                charRange 47 57,
+                                charRange 65 90,
+                                charRange 92 92,
+                                charRange 94 126]
+      deEncode1 = do charset <- liftM (map toLower) token
+                     _ <- char '?'
+                     decoder <- alternatives' [(char 'q', decodeQuotedPrintable),
+                                               (char 'Q', decodeQuotedPrintable),
+                                               (char 'b', decodeBase64),
+                                               (char 'B', decodeBase64)]
+                     _ <- char '?'          
+                     ec <- liftM decoder $ many1 $ alternatives [charRange 33 62,
+                                                                 charRange 64 126]
+                     _ <- char '?'
+                     _ <- char '='
+                     _ <- alternatives $ (map (\x -> char x >> return ()) " \t\r\n\v") ++ [return ()]
+                     let r1 = IC.convertFuzzy IC.Discard charset "utf-8" $ DBL.pack $ map (fromInteger . toInteger . ord) ec
+                     if DBL.null r1
+                       then Parser $ \_ -> []
+                       else return $ map (chr . fromInteger . toInteger) $ DBL.unpack r1
+  in
+  case run_parser deEncode1 $ ParserState { ps_consumed = False,
+                                            ps_rest = ss,
+                                            ps_dropspace = False} of
+    [] -> '=':'?':(deEncode ss)
+    ((s, ps):_) -> s ++ (deEncode $ ps_rest ps)
+deEncode (x:xs) = x:(deEncode xs)  
+
 runParser :: Show a => Parser a -> String -> Maybe a
 runParser p what =
-  let p' = p `followedBy` eof
+  let p' = (stripCFWS p) `followedBy` eof
   in
   case run_parser p' (ParserState {ps_consumed = False, 
-                                   ps_rest = what,
+                                   ps_rest = deEncode what,
                                    ps_dropspace = False}) of
     ((x, _):_) -> trace ((show what) ++ " -> " ++ (show x)) $
                   Just x
@@ -199,8 +258,9 @@ unstructured =
      return [concat r]
 utext :: Parser String
 utext =
-  alternatives [liftM (\x -> [x]) noWsCtl,
-                liftM (\x -> [x]) $ charRange 33 126,
+  alternatives [liftM singleton noWsCtl,
+                liftM singleton $ charRange 33 126,
+                liftM singleton $ charRange 128 255,
                 obsUtext]
 address :: Parser [String]
 address = alternatives [mailbox, group, liftM singleton phrase]
@@ -266,7 +326,7 @@ domainLiteral =
 dcontent :: Parser String
 dcontent = alternatives [liftM singleton dtext, quotedPair]
 dtext :: Parser Char
-dtext = alternatives [noWsCtl, charRange 33 90, charRange 94 126]
+dtext = alternatives [noWsCtl, charRange 33 90, charRange 94 126, charRange 128 255]
 noWsCtl :: Parser Char
 noWsCtl =
   alternatives [charRange 1 8,
@@ -295,14 +355,22 @@ cText =
   alternatives [noWsCtl,
                 charRange 33 39,
                 charRange 42 91,
-                charRange 93 126] >> return ()
+                charRange 93 126,
+                charRange 128 255] >> return ()
 wSP :: Parser ()
 wSP = (alternatives $ map char " \r\t\n\v") >> return ()
 aText :: Parser Char
 aText =
-  alternatives $
-  map char
-  "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM!#$%&\'*+-/=?^_`{|}~"
+  alternatives [ charRange 33 33,
+                 charRange 35 39,
+                 charRange 42 43,
+                 charRange 45 45,
+                 charRange 47 57,
+                 charRange 61 61,
+                 charRange 63 63,
+                 charRange 65 90,
+                 charRange 94 126,
+                 charRange 128 255]
 quotedString :: Parser String
 quotedString =
   do _ <- char '"'
@@ -316,7 +384,8 @@ qtext =
   alternatives [noWsCtl,
                 charRange 33 33,
                 charRange 35 91,
-                charRange 93 126]
+                charRange 93 126,
+                charRange 128 255]
 obsMboxList :: Parser [String]
 obsMboxList =
   liftM (concat . demaybe) $ many1Sep (optional mailbox) (stripCFWS $ char ',')
@@ -365,14 +434,15 @@ obsChar :: Parser Char
 obsChar =
   alternatives [ charRange 0 9,
                  charRange 11 12,
-                 charRange 14 127]
+                 charRange 14 127,
+                 charRange 128 255]
 phrase :: Parser String
 phrase =
   liftM (intercalate " ") $
   many1Sep (alternatives [(many1greedy (alternatives [aText, char '.', char ',', char ':', char ';', char '@'])),
                           quotedString]) cFWS
 obsQp :: Parser Char
-obsQp = (char '\\') >> charRange 0 127
+obsQp = (char '\\') >> charRange 0 255
 
 stringField :: Parser [String] -> Parser [DS.SQLData]
 stringField = liftM (map $ DS.SQLText . DT.pack)
