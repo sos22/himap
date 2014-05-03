@@ -463,7 +463,8 @@ referencesParser =
 -- mapping from RFC822 header name to (attribute name, attribute
 -- parser) pairs.
 parsers :: [(String, (String, Parser [DS.SQLData]))]
-parsers = [("in-reply-to", ("rfc822.In-Reply-To", inReplyToParser)),
+parsers = [("message-id", ("rfc822.Message-Id", msgId)),
+           ("in-reply-to", ("rfc822.In-Reply-To", inReplyToParser)),
            ("references", ("rfc822.References", referencesParser)),
            ("from", ("rfc822.From", stringField mailboxList)),
            ("sender", ("rfc822.Sender", stringField addressList)),

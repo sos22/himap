@@ -16,7 +16,6 @@ import Network.BSD
 import System.Directory
 import System.IO
 import System.Locale
-import System.Posix.Files
 import System.Random
 
 import Email
@@ -27,10 +26,10 @@ import ImapServer
 
 data Journal = Journal { journal_handle :: Handle,
                          journal_path :: FilePath }
-data JournalEntry = JournalStart String
+data JournalEntry = JournalStart String Int64
                   | JournalAddSymlink String String
                   | JournalRegisterMessage String Int64
-                    deriving Show
+                    deriving (Show, Read)
 
 openCreate :: FilePath -> IO (Maybe Handle)
 openCreate path = do exists <- doesFileExist path
@@ -41,10 +40,7 @@ openCreate path = do exists <- doesFileExist path
 journalWrite :: Journal -> JournalEntry -> IO ()
 journalWrite journal je =
   let h = journal_handle journal in
-  do hPutStrLn h $ case je of
-       JournalStart msgId -> "start " ++ msgId
-       JournalAddSymlink msgId name -> "symlink " ++ msgId ++ " " ++ name
-       JournalRegisterMessage msgId msgDbId -> "register " ++ msgId ++ " " ++ (show msgDbId)
+  do hPutStrLn h $ show je
      hFlush h
   
 openMessageJournal :: IO Journal
@@ -65,18 +61,24 @@ flattenEmail :: Email -> BS.ByteString
 flattenEmail eml =
   BS.append (BS.concat $ map flattenHeader (eml_headers eml)) $ BS.append (stringToByteString "\r\n") $ eml_body eml
 
+dbExec :: DS.Database -> String -> [DS.SQLData] -> IO ()
+dbExec database what values =
+  withStatement database (DT.pack what) $ \stmt ->
+  do DS.bind stmt values
+     r <- DS.step stmt
+     case r of
+       DS.Done -> return ()
+       _ -> error $ "dbExec " ++ what ++ " didn't work?"
+     return ()
 addDbRow :: DS.Database -> String -> [DS.SQLData] -> IO ()
 addDbRow database table values =
-  withStatement database (DT.pack $ "INSERT INTO " ++ table ++ " VALUES (" ++ (intercalate ", " (map (const "?") values)) ++ ")") $ \stmt ->
-  do DS.bind stmt values
-     DS.step stmt
-     return ()
+  dbExec database ("INSERT INTO " ++ table ++ " VALUES (" ++ (intercalate ", " (map (const "?") values)) ++ ")") values
      
-addAttribute :: DS.Database -> [(String, DS.SQLData)] -> Int64 -> String -> DS.SQLData -> IO ()
+addAttribute :: DS.Database -> [(String, DS.SQLData)] -> MsgUid -> String -> DS.SQLData -> IO ()
 addAttribute database attribs msgId attribName value =
   case lookup attribName attribs of
     Nothing -> error $ "Bad attribute " ++ (show attribName)
-    Just attrib -> addDbRow database "MessageAttrs" [DS.SQLInteger msgId, attrib, value]
+    Just attrib -> addDbRow database "MessageAttrs" [msgId, attrib, value]
     
 allocMsgDbId :: DS.Database -> IO Int64
 allocMsgDbId database =
@@ -89,8 +91,10 @@ allocMsgDbId database =
                       [DS.SQLInteger nextId] ->
                         withStatement database (DT.pack "UPDATE NextMessageId SET Val = ?") $ \stmt' ->
                         do DS.bindInt64 stmt' (DS.ParamIndex 1) (nextId + 1)
-                           DS.step stmt'
-                           DS.step stmt'
+                           rrr <- DS.step stmt'
+                           case rrr of
+                             DS.Row -> error "update to allocate message ID didn't work?"
+                             DS.Done -> return ()
                            return nextId
                       _ -> error $ "NextMessageId table contained unexpected value " ++ (show v)
        _ -> error $ "Cannot query NextMessageId table"
@@ -120,71 +124,94 @@ ensureMessageId eml =
          let newIdent = (show ident) ++ "@" ++ hostname ++ "-harbinger"
          return $ eml {eml_headers = (Header "Message-Id" newIdent):(eml_headers eml)}
 
-addReceivedDate :: Email -> IO (Email, UTCTime)
-addReceivedDate eml =
-  do now <- Data.Time.getCurrentTime
-     let fmtTime = Data.Time.Format.formatTime System.Locale.defaultTimeLocale "%F %T" now
-     return (addHeader (Header "X-Harbinger-Received" fmtTime) eml,
-             now)
-
-emailPoolFile :: Email -> (String, String)
-emailPoolFile eml =
-  case fmap sanitiseForPath $ getHeader "Message-ID" eml of
-    Nothing -> error "message has no ID?"
-    Just msgId -> let poolDir = "harbinger/pool/" ++ (take 5 msgId)
-                      poolFile = poolDir ++ "/" ++ msgId
-                  in (poolDir, poolFile)
-
-addHeader :: Header -> Email -> Email
-addHeader hdr eml = eml { eml_headers = hdr:(eml_headers eml) }
-
 getHeader :: String -> Email -> Maybe String
 getHeader name eml =
   lookup (map toLower name) $ map (\(Header x y) -> (map toLower x,y)) $ eml_headers eml
 
-removeHeader :: String -> Email -> Email
-removeHeader hdr eml = eml { eml_headers = filter (\(Header name _) -> (map toLower name) /= (map toLower hdr)) $ eml_headers eml }
+findHeader :: String -> Email -> [DS.SQLData]
+findHeader name eml =
+  let n = map toLower name in
+  case find (\(Header x _) -> n == map toLower x) $ eml_headers eml of
+    Nothing -> []
+    Just x -> case parseHeader x of
+      Left _ -> []
+      Right y -> map snd y
+  
+dupeCheck :: [(String, DS.SQLData)] -> DS.Database -> Email -> IO (Maybe MsgUid)
+dupeCheck attribs database eml =
+  let mMsgId = head $ findHeader "Message-Id" eml
+      mSubject =
+        case findHeader "Subject" eml of
+          [] -> DS.SQLText $ DT.pack "<<<no subject>>>"
+          (x:_) -> x
+      mFrom =
+        case findHeader "From" eml of
+          [] -> case findHeader "Sender" eml of
+            [] -> DS.SQLText $ DT.pack "<<<no sender>>>"
+            (x:_) -> x
+          (x:_) -> x
+  in
+  case (lookup "rfc822.Subject" attribs,
+        lookup "rfc822.From" attribs,
+        lookup "rfc822.Message-Id" attribs) of
+    (Just subject, Just from, Just msgId) ->
+      withStatement database
+      (DT.pack
+       "SELECT msgId.MessageId FROM MessageAttrs AS msgId JOIN MessageAttrs AS subject JOIN MessageAttrs AS frm ON msgId.AttributeId = ? AND msgId.Value = ? AND msgId.MessageId = subject.MessageId AND subject.AttributeId = ? AND subject.Value = ? AND frm.AttributeId = ? AND frm.Value = ? AND frm.MessageId = subject.MessageId") $ \stmt ->
+      do DS.bind stmt [msgId, mMsgId, subject, mSubject, from, mFrom]
+         r <- DS.step stmt
+         case r of
+           DS.Row -> do v <- DS.columns stmt
+                        return $ case v of
+                          [rr] -> Just rr
+                          _ -> error $ "Unexpected result " ++ (show v) ++ " from dupe check query"
+           _ -> return Nothing
+    _ -> error "harbinger DB not correctly initialised"                      
+    
+addMessageToPool :: [(String, DS.SQLData)] -> Journal -> DS.Database -> Email -> IO (String, MsgUid)
+addMessageToPool attribs journal database email =
+  do existing <- dupeCheck attribs database email
+     case existing of
+       Just x ->
+         do r <- withStatement database (DT.pack "SELECT Location FROM Messages WHERE MessageId = ?") $ \stmt ->
+              do DS.bind stmt [x]
+                 r <- DS.step stmt
+                 case r of
+                   DS.Row -> do v <- DS.columns stmt
+                                return $ case v of
+                                  [DS.SQLText t] -> DT.unpack t
+                                  _ -> error $ "unexpected result " ++ (show v) ++ " getting location of existing message"
+                   _ -> error "cannot get location of existing message"
+            return (r, x)
+       Nothing ->
+         do msgDbId <- allocMsgDbId database
+            now <- Data.Time.getCurrentTime
+            let prefix = Data.Time.Format.formatTime System.Locale.defaultTimeLocale "harbinger/byDate/%F/" now
+            createDirectoryIfMissing True prefix
+            let fname = prefix ++ "/" ++ (show msgDbId)
+            journalWrite journal $ JournalStart fname msgDbId
+            hh <- openCreate fname
+            case hh of
+              Nothing -> error $ "Failed to generate unique message ID! (" ++ prefix ++ ", " ++ (show msgDbId) ++ ")"
+              Just hh' ->
+                do BS.hPut hh' $ flattenEmail email
+                   hClose hh'
+                   addDbRow database "Messages" [DS.SQLInteger msgDbId, DS.SQLText $ DT.pack fname]
+                   return (fname, DS.SQLInteger msgDbId)
 
-deMaybe :: Maybe a -> a
-deMaybe (Just x) = x
-deMaybe Nothing = error "Maybe wasn't?"
-
-sanitiseForPath :: String -> String
-sanitiseForPath = filter $ flip elem "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM,^@%-+_:"
-
+purgeMessage :: DS.Database -> String -> DS.SQLData -> IO ()
+purgeMessage database fname dbId =
+  do removeFile fname
+     dbExec database "DELETE FROM Messages WHERE MessageId = ?" [dbId]
+     dbExec database "DELETE FROM MessageAttrs WHERE MessageId = ?" [dbId]
+     
 fileEmail :: Maybe String -> [MessageFlag] -> DS.Database -> [(String,DS.SQLData)] -> Email -> IO Bool
-fileEmail mailbox flags database attribs eml =
-  do (eml', receivedAt) <- ensureMessageId eml >>= addReceivedDate
-     let (_, poolFile) = emailPoolFile eml'
-     conflict <- doesFileExist poolFile
-     eml'' <- if conflict
-              then ensureMessageId $
-                   addHeader (Header "X-Harbinger-Old-Id" $ deMaybe $ getHeader "Message-Id" eml') $
-                   removeHeader "Message-Id" eml'
-              else return eml'
-     let (poolDir', poolFile') = emailPoolFile eml''
-     conflict' <- doesFileExist poolFile'
-     if conflict'
-       then error $ "Failed to generate unique message ID! (" ++ poolFile ++ ", " ++ poolFile' ++ ")"
-       else return ()
-     createDirectoryIfMissing True poolDir'
+fileEmail mailbox flags database attribs eml =  
+  do eml' <- ensureMessageId eml
      j <- openMessageJournal
-     let msgId = deMaybe $ getHeader "Message-Id" eml''
-     journalWrite j $ JournalStart msgId
-     hh <- openFile poolFile' WriteMode
-     BS.hPut hh $ flattenEmail eml''
-     hClose hh
-     let dateSymlinkDir = Data.Time.Format.formatTime System.Locale.defaultTimeLocale "harbinger/byDate/%F/" receivedAt
-         dateSymlinkPath = dateSymlinkDir ++ (sanitiseForPath $ deMaybe $ getHeader "Message-Id" eml'')
-     createDirectoryIfMissing True dateSymlinkDir
-     journalWrite j $ JournalAddSymlink msgId dateSymlinkPath
-     createSymbolicLink ("../../../" ++ poolFile') dateSymlinkPath
-     msgDbId <- allocMsgDbId database
-     journalWrite j $ JournalRegisterMessage msgId msgDbId
+     (fname, msgDbId) <- addMessageToPool attribs j database eml'
      failed <- transactional database $
-       do addDbRow database "Messages" [DS.SQLInteger msgDbId, DS.SQLText $ DT.pack poolFile']
-          addAttribute database attribs msgDbId "rfc822.Message-Id" (DS.SQLText $ DT.pack msgId)
-          failed <- liftM or $ flip mapM (eml_headers eml'') $ \header ->
+       do failed <- liftM or $ flip mapM (eml_headers eml') $ \header ->
             case parseHeader header of
               Left err -> hPutStrLn stderr err >> return True
               Right dbattribs ->
@@ -199,8 +226,9 @@ fileEmail mailbox flags database attribs eml =
                       Nothing -> return ()
           return failed
      if failed
-       then return False
-       else do hClose $ journal_handle j
-               {- XXX Need to do an fsync here XXX -}
-               removeFile $ journal_path j
-               return True
+       then purgeMessage database fname msgDbId
+       else return ()
+     hClose $ journal_handle j
+     {- XXX Need to do an fsync here XXX -}
+     removeFile $ journal_path j
+     return $ not failed
