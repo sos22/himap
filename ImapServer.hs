@@ -27,6 +27,7 @@ import Data.IORef
 import qualified Data.Text as DT
 import qualified Database.SQLite3 as DS
 import Debug.Trace
+import qualified OpenSSL.Session as SSL
 import System.IO
 
 import Email
@@ -53,7 +54,7 @@ instance Monad ImapServer where
            run_is (secondF firstRes') newState
 
 
-data ImapServerState = ImapServerState { iss_handle :: Handle, 
+data ImapServerState = ImapServerState { iss_handle :: Either Handle SSL.SSL,
                                          iss_outgoing_response :: [BS.ByteString],
                                          iss_inbuf :: IORef BS.ByteString,
                                          iss_inbuf_idx :: Int,
@@ -158,9 +159,12 @@ queueResponse = queueResponseBs . stringToByteString
 
 finishResponse :: ImapServer ()
 finishResponse = ImapServer $ \isState ->
-  let worker [] = return ()
-      worker (x:xs) = worker xs >> ((trace $ "sending " ++ (byteStringToString x)) $ BS.hPut (iss_handle isState) x)
-  in do worker (iss_outgoing_response isState)
-        hFlush (iss_handle isState)
+  let (sender, flusher) =
+        case iss_handle isState of
+          Left handle ->
+            (sequence_ . map (BS.hPut handle) . reverse, hFlush handle)
+          Right ssl ->
+            (SSL.write ssl . BS.concat . reverse, return ())
+  in do sender $ map (\x -> trace ("sending " ++ (byteStringToString x)) x) $ iss_outgoing_response isState
+        flusher
         return $ Right (isState {iss_outgoing_response = []}, ())
-

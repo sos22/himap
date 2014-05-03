@@ -50,7 +50,7 @@ runImapServer hndle is =
   do inbuf <- newIORef BS.empty
      database <- DS.open $ DT.pack "harbinger.db"
      ignore $ run_is (loadAttributes >> loadMailboxList >> is) $
-       ImapServerState { iss_handle = hndle, 
+       ImapServerState { iss_handle = Left hndle, 
                          iss_outgoing_response = [],
                          iss_inbuf = inbuf, 
                          iss_inbuf_idx = 0,

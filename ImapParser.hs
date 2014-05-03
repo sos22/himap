@@ -8,6 +8,7 @@ import Data.IORef
 import qualified Database.SQLite3 as DS
 import Data.Word
 import Debug.Trace
+import qualified OpenSSL.Session as SSL
 
 import Util
 
@@ -28,7 +29,9 @@ lookaheadByte = ImapRequestParser worker
   where worker state =
           do inbuf <- readIORef $ iss_inbuf state
              if iss_inbuf_idx state >= BS.length inbuf
-               then do nextChunk <- BS.hGetSome (iss_handle state) 4096
+               then do nextChunk <- case iss_handle state of
+                         Left handle -> BS.hGetSome handle 4096
+                         Right ssl -> SSL.read ssl 4096
                        trace ("grabbed chunk " ++ (byteStringToString nextChunk)) $
                          if BS.length nextChunk == 0
                          then return $ Left ImapStopFinished
@@ -53,7 +56,9 @@ readCountedByteString amt = ImapRequestParser worker
   where worker state =
           do inbuf <- readIORef $ iss_inbuf state
              if amt + iss_inbuf_idx state >= BS.length inbuf
-               then do nextChunk <- BS.hGetSome (iss_handle state) (amt - iss_inbuf_idx state)
+               then do nextChunk <- case iss_handle state of
+                         Left handle -> BS.hGetSome handle (amt - iss_inbuf_idx state)
+                         Right ssl -> SSL.read ssl 4096
                        if BS.length nextChunk == 0
                          then return $ Left ImapStopBacktrack
                          else do modifyIORef (iss_inbuf state) (flip BS.append nextChunk)
