@@ -11,6 +11,9 @@ import Debug.Trace
 import qualified Database.SQLite3 as DS
 import qualified Data.Text as DT
 import qualified Data.ByteString as BS
+import qualified OpenSSL
+import qualified OpenSSL.Session as SSL
+import System.Posix.IO
 
 import Deliver
 import Email
@@ -374,6 +377,29 @@ processCommand (Right (tag, cmd)) =
                   if success
                     then sendResponseOk tag [] "APPEND complete"
                     else sendResponseBad tag [] "APPEND failed"
+    ImapStartTls ->
+      do handle' <- ImapServer $ \state ->
+           return $ Right (state, case iss_handle state of
+                              Left hndle -> Just hndle
+                              Right _ssl -> Nothing)
+         case handle' of
+           Nothing ->
+             sendResponseBad tag [] "Already in SSL mode?"
+           Just hndle ->
+             do sendResponseOk tag [] "Start TLS now"
+                ImapServer $ \state ->
+                     do fd <- handleToFd hndle
+                        ctxt <- SSL.context
+                        SSL.contextSetPrivateKeyFile ctxt "harbinger.key"
+                        SSL.contextSetCertificateFile ctxt "harbinger.cert"
+                        SSL.contextSetDefaultCiphers ctxt
+                        SSL.contextSetVerificationMode ctxt SSL.VerifyNone
+                        putStrLn "building ssl"
+                        ssl <- SSL.fdConnection ctxt fd
+                        putStrLn "doing SSL server handshake"
+                        SSL.accept ssl
+                        putStrLn "Done SSL server handshake"
+                        return $ Right (state {iss_handle = Right ssl}, ())
     ImapCommandBad l -> sendResponseBad tag [] $ "Bad command " ++ l
 
 loadMessage :: MsgSequenceNumber -> ImapServer Message
@@ -591,6 +617,7 @@ processClient clientHandle =
 main :: IO ()
 main =
   withSocketsDo $
+  OpenSSL.withOpenSSL $
   do listenSock <- listenOn $ PortNumber 5000
      forever $ do (clientHandle, clientHost, clientPort) <- accept listenSock
                   print $ "Accepted from " ++ clientHost ++ ", " ++ (show clientPort)
