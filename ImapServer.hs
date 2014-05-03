@@ -146,6 +146,7 @@ data ImapCommand = ImapNoop
                  | ImapExpunge
                  | ImapClose
                  | ImapLogout
+                 | ImapStartTls
                  | ImapCommandBad String
                    deriving Show
 

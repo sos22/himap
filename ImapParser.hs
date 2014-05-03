@@ -257,7 +257,8 @@ readCommand =
                                                                    parseQuoted
                                          requireChar ' '
                                          msg <- parseLiteralByteString
-                                         return $ ImapAppend mbox flags datetime msg)]
+                                         return $ ImapAppend mbox flags datetime msg),
+                          ("STARTTLS", return ImapStartTls)]
         parseFetchAttributes = alternates [do requireString "ALL"
                                               return [FetchAttrFlags,
                                                       FetchAttrInternalDate,

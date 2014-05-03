@@ -287,11 +287,20 @@ processCommand (Left err) =
 processCommand (Right (tag, cmd)) =
   trace ("Run command " ++ (show cmd)) $
   case cmd of
-    ImapCapability -> do sendResponse ResponseUntagged ResponseStateNone [] "CAPABILITY IMAP4rev1"
+    ImapCapability -> do cap <- ImapServer $ \state -> return $ Right (state, case iss_handle state of
+                                                                          Left _nonSsl -> " STARTTLS LOGINDISABLED"
+                                                                          Right _ssl -> "")
+                         sendResponse ResponseUntagged ResponseStateNone [] $ "CAPABILITY IMAP4rev1" ++ cap
                          sendResponseOk tag [] "Done capability"
     ImapNoop -> sendResponseOk tag [] "Done noop"
-    ImapLogin username password -> trace ("login as " ++ username ++ ", password " ++ password) $
-                                   sendResponseOk tag [] "Logged in"
+    ImapLogin username password ->
+      do allowed <- ImapServer $ \state -> return $ Right (state, case iss_handle state of
+                                                              Left _nonSsl -> False
+                                                              Right _ssl -> True)
+         if allowed
+           then trace ("login as " ++ username ++ ", password " ++ password) $
+                sendResponseOk tag [] "Logged in"
+           else sendResponseBad tag [] "no login without SSL"
     ImapList reference mailbox ->
       do r <- imapListCommand tag reference mailbox
          if r
