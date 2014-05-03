@@ -360,7 +360,7 @@ processCommand (Right (tag, cmd)) =
              Left _ -> sendResponseBad tag [] "APPEND bad message"
              Right parsed ->
                do success <- ImapServer $ \state ->
-                    do s <- fileEmail mailbox flags (iss_database state) (iss_attributes state) parsed
+                    do s <- fileEmail (Just mailbox) flags (iss_database state) (iss_attributes state) parsed
                        return $ Right (state, s)
                   if success
                     then sendResponseOk tag [] "APPEND complete"

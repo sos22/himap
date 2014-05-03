@@ -99,7 +99,7 @@ main =
        Left errs -> do print $ byteStringToString content
                        putStrLn $ "Failed: " ++ (show errs) ++ "\n"
        Right parsed' ->
-         do success <- fileEmail "INBOX" [] database attribs parsed'
+         do success <- fileEmail Nothing [] database attribs parsed'
             if success
               then exitSuccess
               else exitFailure

@@ -152,7 +152,7 @@ deMaybe Nothing = error "Maybe wasn't?"
 sanitiseForPath :: String -> String
 sanitiseForPath = filter $ flip elem "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM,^@%-+_:"
 
-fileEmail :: String -> [MessageFlag] -> DS.Database -> [(String,DS.SQLData)] -> Email -> IO Bool
+fileEmail :: Maybe String -> [MessageFlag] -> DS.Database -> [(String,DS.SQLData)] -> Email -> IO Bool
 fileEmail mailbox flags database attribs eml =
   do (eml', receivedAt) <- ensureMessageId eml >>= addReceivedDate
      let (_, poolFile) = emailPoolFile eml'
@@ -194,7 +194,9 @@ fileEmail mailbox flags database attribs eml =
             then hPutStrLn stderr "failed to add message to index"
             else do flip mapM_ (MessageFlagRecent:flags) $ \flag ->
                       addAttribute database attribs msgDbId (msgFlagDbName flag) (DS.SQLInteger 1)
-                    addAttribute database attribs msgDbId "harbinger.mailbox" (DS.SQLText $ DT.pack mailbox)
+                    case mailbox of
+                      Just mailbox' -> addAttribute database attribs msgDbId "harbinger.mailbox" (DS.SQLText $ DT.pack mailbox')
+                      Nothing -> return ()
           return failed
      if failed
        then return False
