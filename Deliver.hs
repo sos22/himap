@@ -187,12 +187,13 @@ addMessageToPool attribs journal database email =
          do msgDbId <- allocMsgDbId database
             now <- Data.Time.getCurrentTime
             let prefix = Data.Time.Format.formatTime System.Locale.defaultTimeLocale "harbinger/byDate/%F/" now
-            createDirectoryIfMissing True prefix
-            let fname = prefix ++ "/" ++ (show msgDbId)
+                prefix' = prefix ++ "/" ++ (show $ msgDbId `div` 1000)
+            createDirectoryIfMissing True prefix'
+            let fname = prefix' ++ "/" ++ (show msgDbId)
             journalWrite journal $ JournalStart fname msgDbId
             hh <- openCreate fname
             case hh of
-              Nothing -> error $ "Failed to generate unique message ID! (" ++ prefix ++ ", " ++ (show msgDbId) ++ ")"
+              Nothing -> error $ "Failed to generate unique message ID! (" ++ prefix' ++ ", " ++ (show msgDbId) ++ ")"
               Just hh' ->
                 do BS.hPut hh' $ flattenEmail email
                    hClose hh'
