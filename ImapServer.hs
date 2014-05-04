@@ -9,6 +9,7 @@ module ImapServer(ImapServerState(..),
                   SectionSpec(..),
                   MimeSectionPath(..),
                   ByteRange(..),
+                  Mbox(..),
                   MsgUid,
                   ImapServer(..),
                   msgFlagName,
@@ -31,6 +32,7 @@ import qualified OpenSSL.Session as SSL
 import System.IO
 
 import Email
+import MailFilter
 import Util
 
 type MsgUid = DS.SQLData
@@ -38,7 +40,11 @@ type MsgUid = DS.SQLData
 data Message = Message { msg_email :: Email,
                          msg_uid :: DS.SQLData,
                          msg_deleted :: IORef Bool }
-               
+
+data Mbox = MboxPhysical String
+          | MboxLogical MailFilter
+            deriving Show
+                     
 data ImapStopReason = ImapStopFinished
                     | ImapStopFailed String
                     | ImapStopBacktrack
@@ -61,7 +67,7 @@ data ImapServerState = ImapServerState { iss_handle :: Either Handle SSL.SSL,
                                          iss_messages :: [Either MsgUid Message],
                                          iss_database :: DS.Database,
                                          iss_attributes :: [(String, DS.SQLData)],
-                                         iss_selected_mbox :: Maybe DT.Text,
+                                         iss_selected_mbox :: Maybe Mbox,
                                          iss_mailboxes :: [DT.Text],
                                          iss_logged_in :: Bool
                                          }

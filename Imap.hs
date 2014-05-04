@@ -19,6 +19,7 @@ import System.Random
 
 import Deliver
 import Email
+import MailFilter
 import Util
 
 import ImapParser
@@ -176,7 +177,8 @@ expunge sendUntagged =
      mbox' <- ImapServer $ \state -> return $ Right (state, iss_selected_mbox state)
      case mbox' of
        Nothing -> return False
-       Just mbox ->
+       Just (MboxLogical _) -> return False
+       Just (MboxPhysical mbox'') ->
          do toDelete <- foldM (\acc msg ->
                                 case msg of
                                   Left _ -> return acc
@@ -195,7 +197,7 @@ expunge sendUntagged =
                   then return False
                   else do _ <- dbQuery'
                                "DELETE FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ? AND Value = ?"
-                               [uid, mboxAttr, DS.SQLText mbox]
+                               [uid, mboxAttr, DS.SQLText $ DT.pack mbox'']
                           ImapServer $ \state ->
                             return $ Right (state { iss_messages = flip filter (iss_messages state) $
                                                                    \x ->
@@ -288,9 +290,12 @@ isValidPassword username password =
      threadDelay delay
      q <- dbQuery (iss_database state) "SELECT PassHash FROM Users WHERE Username = ?" [DS.SQLText $ DT.pack username]
      let q' = case q of
-           [[DS.SQLText h]] -> stringToByteString $ DT.unpack h
+           [[DS.SQLText h]] -> Just $ stringToByteString $ DT.unpack h
+           [] -> Nothing
            _ -> error $ "Bad result from dbQuery " ++ (show q)
-     return $ Right (state, verifyPassword (stringToByteString password) q')
+     return $ Right (state, case q' of
+                        Nothing -> False
+                        Just q'' -> verifyPassword (stringToByteString password) q'')
 
 loggedIn :: ResponseTag -> ImapServer () -> ImapServer ()
 loggedIn tag what =
@@ -298,7 +303,54 @@ loggedIn tag what =
      if i
        then what
        else sendResponseBad tag [] "Not logged in"
-       
+  
+parseMboxDefn :: String -> Maybe Mbox
+parseMboxDefn ('P':':':xs) =
+  Just $ MboxPhysical xs
+parseMboxDefn ('L':':':xs) =
+  fmap MboxLogical $ parseMailFilter xs
+parseMboxDefn _ =
+  Nothing
+
+parseMbox :: String -> ImapServer (Maybe Mbox)
+parseMbox name =
+  do defn <- dbQuery' "SELECT Definition FROM MailBoxes WHERE Name = ?" [DS.SQLText $ DT.pack name]
+     trace ("DB definition of " ++ name ++ " -> " ++ (show defn)) $
+      return $ case defn of
+       [[DS.SQLText t]] -> parseMboxDefn (DT.unpack t)
+       [] -> Nothing
+       _ -> error "odd result from mailbox definition query"
+                   
+runMessageQuery :: MailFilter -> ImapServer [MsgUid]
+runMessageQuery q =
+  let (query, attribBinders, constBinders) = mailFilterQuery q
+      constBinders' = map (\(constVal, paramName) ->
+                            (DT.pack $ '@':paramName,
+                             case constVal of
+                                ConstString s -> DS.SQLText $ DT.pack s
+                                ConstNumber n -> DS.SQLInteger $ fromInteger n)) constBinders
+      fetchResults stmt =
+        do r <- DS.step stmt
+           case r of
+             DS.Done -> return []
+             DS.Row ->
+               do v <- DS.columns stmt
+                  case v of
+                    [v'] -> do rest <- fetchResults stmt
+                               return (v':rest)
+                    _ -> error "sqlite returned odd results?"
+  in trace ("Message query is " ++ query) $
+     trace ("attrib binders " ++ (show attribBinders)) $
+     trace ("constBinders " ++ (show constBinders)) $
+     do attribIdents <- mapM (\(attribName, paramName) -> do r <- findAttribute attribName
+                                                             return (DT.pack $ '@':paramName, r))
+                        attribBinders
+        dbRes <- ImapServer $ \state ->
+          do prepped <- DS.prepare (iss_database state) (DT.pack query)
+             res <- (do DS.bindNamed prepped (attribIdents ++ constBinders')
+                        fetchResults prepped) `finally` (DS.finalize prepped)
+             return $ Right (state, res)
+        return $ sortUids dbRes
 processCommand :: Either String (ResponseTag, ImapCommand) -> ImapServer ()
 processCommand (Left err) =
   trace ("Failed: " ++ err) $ sendResponseBad ResponseUntagged [] $ "Failed: " ++ err
@@ -332,36 +384,52 @@ processCommand (Right (tag, cmd)) =
            else return ()
     ImapSelect mailbox ->
       loggedIn tag $
-      do isValidMbox <- checkValidMbox mailbox
-         if not isValidMbox
-           then sendResponseBad tag [] "SELECT non-existent mailbox"
-           else do mboxAttr <- findAttribute "harbinger.mailbox"
-                   recentAttr <- findAttribute "harbinger.recent"
-                   seenAttr <- findAttribute "harbinger.seen"
-                   let sqlMbox = DS.SQLText $ DT.pack mailbox
-                       countByFlag flagAttr =
-                         dbQuery' "SELECT COUNT(DISTINCT attr1.MessageId) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1" [mboxAttr, sqlMbox, flagAttr]
-                   uids <- liftM (map head) $ dbQuery' "SELECT DISTINCT MessageId FROM MessageAttrs WHERE AttributeId = ? AND Value = ?" [mboxAttr, sqlMbox]
-                   sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length uids) ++ " EXISTS"
-                   recent <- countByFlag recentAttr
-                   sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length recent) ++ " RECENT"
-                   sendResponse ResponseUntagged ResponseStateNone [] "FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\Recent)"
-                   seen <- liftM (sortUids . map head) $ dbQuery' "SELECT attr1.MessageId FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1 ORDER BY attr1.MessageId" [mboxAttr, sqlMbox, seenAttr]
-                   case seen of
-                     [] -> return ()
-                     (x:_) -> case elemIndex x uids of
-                       Nothing -> return ()
-                       Just idx -> sendResponse ResponseUntagged ResponseStateNone [] $ "OK [UNSEEN " ++ (show idx) ++ "]"
-                   sendResponse ResponseUntagged ResponseStateNone [] "OK [UIDVALIDITY 12345]"
-                   nextUid <- dbQuery' "SELECT Val FROM NextMessageId" []
-                   case nextUid of
-                     [[DS.SQLInteger i]] ->
-                       sendResponse ResponseUntagged ResponseStateNone [] $ "OK [UIDNEXT " ++ (show i) ++ "]"
-                     _ -> error $ "NextMessageId query produced unexpected result " ++ (show nextUid)
-                   sendResponse ResponseUntagged ResponseStateNone [] "OK [PERMANENTFLAGS ()]"
-                   sendResponseOk tag [ResponseAttribute "READ-WRITE"] "SELECT completed"
-                   ImapServer $ \state -> return $ Right (state {iss_messages = map Left uids,
-                                                                 iss_selected_mbox = Just $ DT.pack mailbox}, ())
+      do mbox <- parseMbox mailbox
+         case mbox of
+           Nothing ->
+             sendResponseBad tag [] "SELECT non-existent mailbox"
+           Just (MboxPhysical _) ->
+             do mboxAttr <- findAttribute "harbinger.mailbox"
+                recentAttr <- findAttribute "harbinger.recent"
+                seenAttr <- findAttribute "harbinger.seen"
+                let sqlMbox = DS.SQLText $ DT.pack mailbox
+                    countByFlag flagAttr =
+                      dbQuery' "SELECT COUNT(DISTINCT attr1.MessageId) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1" [mboxAttr, sqlMbox, flagAttr]
+                uids <- liftM (map head) $ dbQuery' "SELECT DISTINCT MessageId FROM MessageAttrs WHERE AttributeId = ? AND Value = ?" [mboxAttr, sqlMbox]
+                sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length uids) ++ " EXISTS"
+                recent <- countByFlag recentAttr
+                sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length recent) ++ " RECENT"
+                sendResponse ResponseUntagged ResponseStateNone [] "FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\Recent)"
+                seen <- liftM (sortUids . map head) $ dbQuery' "SELECT attr1.MessageId FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1 ORDER BY attr1.MessageId" [mboxAttr, sqlMbox, seenAttr]
+                case seen of
+                  [] -> return ()
+                  (x:_) -> case elemIndex x uids of
+                    Nothing -> return ()
+                    Just idx -> sendResponse ResponseUntagged ResponseStateNone [] $ "OK [UNSEEN " ++ (show idx) ++ "]"
+                sendResponse ResponseUntagged ResponseStateNone [] "OK [UIDVALIDITY 12345]"
+                nextUid <- dbQuery' "SELECT Val FROM NextMessageId" []
+                case nextUid of
+                  [[DS.SQLInteger i]] ->
+                    sendResponse ResponseUntagged ResponseStateNone [] $ "OK [UIDNEXT " ++ (show i) ++ "]"
+                  _ -> error $ "NextMessageId query produced unexpected result " ++ (show nextUid)
+                sendResponse ResponseUntagged ResponseStateNone [] "OK [PERMANENTFLAGS ()]"
+                sendResponseOk tag [ResponseAttribute "READ-WRITE"] "SELECT completed"
+                ImapServer $ \state -> return $ Right (state {iss_messages = map Left uids,
+                                                              iss_selected_mbox = mbox }, ())
+           Just (MboxLogical query) ->
+             do uids <- runMessageQuery query 
+                sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length uids) ++ " EXISTS"
+                sendResponse ResponseUntagged ResponseStateNone [] "FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\Recent)"
+                sendResponse ResponseUntagged ResponseStateNone [] "OK [UIDVALIDITY 12345]"
+                nextUid <- dbQuery' "SELECT Val FROM NextMessageId" []
+                case nextUid of
+                  [[DS.SQLInteger i]] ->
+                    sendResponse ResponseUntagged ResponseStateNone [] $ "OK [UIDNEXT " ++ (show i) ++ "]"
+                  _ -> error $ "NextMessageId query produced unexpected result " ++ (show nextUid)
+                sendResponse ResponseUntagged ResponseStateNone [] "OK [PERMANENTFLAGS ()]"
+                sendResponseOk tag [ResponseAttribute "READ-WRITE"] "SELECT completed"
+                ImapServer $ \state -> return $ Right (state {iss_messages = map Left uids,
+                                                              iss_selected_mbox = mbox}, ())
     ImapFetch sequenceNumbers attributes ->
       loggedIn tag $
       do sequence_ $ map (fetchMessage attributes) sequenceNumbers
