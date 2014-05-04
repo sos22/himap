@@ -62,7 +62,8 @@ data ImapServerState = ImapServerState { iss_handle :: Either Handle SSL.SSL,
                                          iss_database :: DS.Database,
                                          iss_attributes :: [(String, DS.SQLData)],
                                          iss_selected_mbox :: Maybe DT.Text,
-                                         iss_mailboxes :: [DT.Text]
+                                         iss_mailboxes :: [DT.Text],
+                                         iss_logged_in :: Bool
                                          }
 
 data ResponseTag = ResponseUntagged

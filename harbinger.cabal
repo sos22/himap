@@ -49,11 +49,16 @@ executable harbinger-mda
   -- other-modules:       
   
   -- Other library packages from which modules are imported.
-  build-depends:       base ==4.5.*, mtl >= 2.0, bytestring >= 0.9, network >= 2.3, random >= 1.0, time >= 1.2, old-locale >= 1.0, directory >= 1.1, unix >= 2.5, direct-sqlite >= 2.3,  text >= 0.11, iconv >= 0.4, sandi >= 0.2, HsOpenSSL >= 0.10
+  build-depends:       base ==4.5.*, mtl >= 2.0, bytestring >= 0.9, network >= 2.3, random >= 1.0, time >= 1.2, old-locale >= 1.0, directory >= 1.1, unix >= 2.5, direct-sqlite >= 2.3,  text >= 0.11, iconv >= 0.4, sandi >= 0.2, HsOpenSSL >= 0.10, pwstore-fast >= 2.4
 
   ghc-options: -Wall -auto-all
 
 executable harbinger-imap
   main-is: Imap.hs
-  build-depends: base == 4.5.*, bytestring >= 0.9, network >= 2.3, text >= 0.11, direct-sqlite >= 2.3, mtl >= 2.0, random >= 1.0, unix >= 2.5, old-locale >= 1.0, directory >= 1.1, time >= 1.4, sandi >= 0.2, iconv >= 0.4, HsOpenSSL >= 0.10
+  build-depends: base == 4.5.*, bytestring >= 0.9, network >= 2.3, text >= 0.11, direct-sqlite >= 2.3, mtl >= 2.0, random >= 1.0, unix >= 2.5, old-locale >= 1.0, directory >= 1.1, time >= 1.4, sandi >= 0.2, iconv >= 0.4, HsOpenSSL >= 0.10, pwstore-fast >= 2.4
   ghc-options: -Wall -auto-all -threaded
+
+executable harbinger-user
+  main-is: User.hs
+  ghc-options: -Wall -auto-all
+  build-depends: base == 4.5.*, bytestring >= 0.9, mtl >= 2.0, text >= 0.11, direct-sqlite >= 2.3, pwstore-fast >= 2.4

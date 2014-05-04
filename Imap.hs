@@ -3,6 +3,7 @@ import System.IO
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
+import Crypto.PasswordStore
 import Data.Char
 import Data.Int
 import Data.IORef
@@ -14,6 +15,7 @@ import qualified Data.ByteString as BS
 import qualified OpenSSL
 import qualified OpenSSL.Session as SSL
 import System.Posix.IO
+import System.Random
 
 import Deliver
 import Email
@@ -32,7 +34,7 @@ sortUids = map DS.SQLInteger . sort . map (\x -> case x of
   
 loadAttributes :: ImapServer ()
 loadAttributes =
-  do attribs <- dbQuery "SELECT AttributeId, Description FROM Attributes" []
+  do attribs <- dbQuery' "SELECT AttributeId, Description FROM Attributes" []
      let attribs' = flip map attribs $ \r ->
            case r of
              [attribId, DS.SQLText description] -> (DT.unpack description, attribId)
@@ -41,7 +43,7 @@ loadAttributes =
 
 loadMailboxList :: ImapServer ()
 loadMailboxList =
-  do mailboxes <- dbQuery "SELECT Name FROM MailBoxes" []
+  do mailboxes <- dbQuery' "SELECT Name FROM MailBoxes" []
      let mboxes = flip map mailboxes $ \r ->
            case r of
              [DS.SQLText name] -> name
@@ -61,7 +63,8 @@ runImapServer hndle is =
                          iss_database = database, 
                          iss_selected_mbox = Nothing,
                          iss_attributes = error "failed to load attributes DB?",
-                         iss_mailboxes = error "failed to load mailbox list"}
+                         iss_mailboxes = error "failed to load mailbox list",
+                         iss_logged_in = False}
 
 data ResponseState = ResponseStateOk
                    | ResponseStateNo
@@ -136,19 +139,10 @@ findAttribute name =
   (state, maybe (error $ "unknown message attribute " ++ name) id $
           lookup name $ iss_attributes state)
 
-dbQuery :: String -> [DS.SQLData] -> ImapServer [[DS.SQLData]]
-dbQuery what binders = ImapServer $ \state ->
-  let db = iss_database state
-      fetchAllRows stmt =
-        do r <- DS.step stmt
-           case r of
-             DS.Done -> return []
-             DS.Row ->
-               do v <- DS.columns stmt
-                  liftM ((:) v) $ fetchAllRows stmt
-  in liftM (Right . ((,) state)) $
-     do prepped <- DS.prepare db $ DT.pack what
-        (DS.bind prepped binders >> fetchAllRows prepped) `finally` (DS.finalize prepped)
+dbQuery' :: String -> [DS.SQLData] -> ImapServer [[DS.SQLData]]
+dbQuery' query binders = ImapServer $ \state ->
+  do res <- dbQuery (iss_database state) query binders
+     return $ Right (state, res)
 
 uidToSequenceNumber :: MsgUid -> ImapServer MsgSequenceNumber
 uidToSequenceNumber uid = ImapServer $ \state ->
@@ -199,7 +193,7 @@ expunge sendUntagged =
             let worker acc ((MsgSequenceNumber seqNr), uid) =
                   if not acc
                   then return False
-                  else do _ <- dbQuery
+                  else do _ <- dbQuery'
                                "DELETE FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ? AND Value = ?"
                                [uid, mboxAttr, DS.SQLText mbox]
                           ImapServer $ \state ->
@@ -237,9 +231,9 @@ imapListCommand tag _ _ =
   do sendResponseBad tag [] "LIST bad mailbox or reference"
      return False
 
-dbQueryInt :: String -> [DS.SQLData] -> ImapServer Int64
-dbQueryInt q params =
-  do res <- dbQuery q params
+dbQuery'Int :: String -> [DS.SQLData] -> ImapServer Int64
+dbQuery'Int q params =
+  do res <- dbQuery' q params
      return $ case res of
        [[DS.SQLInteger i]] -> i
        _ -> error $ "Expected query " ++ q ++ " to produce an int, got " ++ (show res)
@@ -251,7 +245,7 @@ imapStatus tag mboxName items =
      mboxAttr <- findAttribute "harbinger.mailbox"
      recentAttr <- findAttribute "harbinger.recent"
      seenAttr <- findAttribute "harbinger.seen"
-     let fromDb what q params = do dbres <- dbQueryInt q params
+     let fromDb what q params = do dbres <- dbQuery'Int q params
                                    return $ (statusItemName what) ++ " " ++ (show dbres)
          worker StatusItemMessages =
            fromDb
@@ -271,10 +265,10 @@ imapStatus tag mboxName items =
          worker StatusItemUidValidity =
            return "UIDVALIDITY 12345"
          worker StatusItemUnseen =
-           do seen <- dbQueryInt
+           do seen <- dbQuery'Int
                       "SELECT COUNT(DISTINCT attr1.MessageId) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1"
                       [mboxAttr, sqlMbox, seenAttr]
-              total <- dbQueryInt
+              total <- dbQuery'Int
                        "SELECT COUNT(DISTINCT MessageId) FROM MessageAttrs WHERE AttributeId = ? AND Value = ?"
                        [mboxAttr, sqlMbox]
               return $ "UNSEEN " ++ (show $ total - seen)
@@ -284,17 +278,39 @@ imapStatus tag mboxName items =
                sendResponse ResponseUntagged ResponseStateNone [] $ "STATUS " ++ mboxName ++ " (" ++ (intercalate " " items') ++ ")"
                sendResponseOk tag [] "STATUS complete"
        
+isValidPassword :: String -> String -> ImapServer Bool
+isValidPassword username password =
+  ImapServer $ \state ->
+  do -- It's the only bit of the server where someone might make a
+     -- timing attack (except for the SSL layer, for which we just
+     -- trust openssl).  Make it a little bit difficult for them
+     delay <- randomRIO (0::Int, 300000)
+     threadDelay delay
+     q <- dbQuery (iss_database state) "SELECT PassHash FROM Users WHERE Username = ?" [DS.SQLText $ DT.pack username]
+     let q' = case q of
+           [[DS.SQLText h]] -> stringToByteString $ DT.unpack h
+           _ -> error $ "Bad result from dbQuery " ++ (show q)
+     return $ Right (state, verifyPassword (stringToByteString password) q')
+
+loggedIn :: ResponseTag -> ImapServer () -> ImapServer ()
+loggedIn tag what =
+  do i <- ImapServer $ \state -> return $ Right (state, iss_logged_in state)
+     if i
+       then what
+       else sendResponseBad tag [] "Not logged in"
+       
 processCommand :: Either String (ResponseTag, ImapCommand) -> ImapServer ()
 processCommand (Left err) =
   trace ("Failed: " ++ err) $ sendResponseBad ResponseUntagged [] $ "Failed: " ++ err
 processCommand (Right (tag, cmd)) =
   trace ("Run command " ++ (show cmd)) $
   case cmd of
-    ImapCapability -> do cap <- ImapServer $ \state -> return $ Right (state, case iss_handle state of
-                                                                          Left _nonSsl -> " STARTTLS LOGINDISABLED"
-                                                                          Right _ssl -> "")
-                         sendResponse ResponseUntagged ResponseStateNone [] $ "CAPABILITY IMAP4rev1" ++ cap
-                         sendResponseOk tag [] "Done capability"
+    ImapCapability ->
+      do cap <- ImapServer $ \state -> return $ Right (state, case iss_handle state of
+                                                          Left _nonSsl -> " STARTTLS LOGINDISABLED"
+                                                          Right _ssl -> "")
+         sendResponse ResponseUntagged ResponseStateNone [] $ "CAPABILITY IMAP4rev1" ++ cap
+         sendResponseOk tag [] "Done capability"
     ImapNoop -> sendResponseOk tag [] "Done noop"
     ImapLogin username password ->
       do allowed <- ImapServer $ \state -> return $ Right (state, case iss_handle state of
@@ -302,14 +318,20 @@ processCommand (Right (tag, cmd)) =
                                                               Right _ssl -> True)
          if allowed
            then trace ("login as " ++ username ++ ", password " ++ password) $
-                sendResponseOk tag [] "Logged in"
+                do valid <- isValidPassword username password
+                   if valid
+                     then do sendResponseOk tag [] "Logged in"
+                             ImapServer $ \state -> return $ Right (state {iss_logged_in = True}, ())
+                     else sendResponseBad tag [] "login failed"
            else sendResponseBad tag [] "no login without SSL"
     ImapList reference mailbox ->
+      loggedIn tag $
       do r <- imapListCommand tag reference mailbox
          if r
            then sendResponseOk tag [] "LIST completed"
            else return ()
     ImapSelect mailbox ->
+      loggedIn tag $
       do isValidMbox <- checkValidMbox mailbox
          if not isValidMbox
            then sendResponseBad tag [] "SELECT non-existent mailbox"
@@ -318,20 +340,20 @@ processCommand (Right (tag, cmd)) =
                    seenAttr <- findAttribute "harbinger.seen"
                    let sqlMbox = DS.SQLText $ DT.pack mailbox
                        countByFlag flagAttr =
-                         dbQuery "SELECT COUNT(DISTINCT attr1.MessageId) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1" [mboxAttr, sqlMbox, flagAttr]
-                   uids <- liftM (map head) $ dbQuery "SELECT DISTINCT MessageId FROM MessageAttrs WHERE AttributeId = ? AND Value = ?" [mboxAttr, sqlMbox]
+                         dbQuery' "SELECT COUNT(DISTINCT attr1.MessageId) FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1" [mboxAttr, sqlMbox, flagAttr]
+                   uids <- liftM (map head) $ dbQuery' "SELECT DISTINCT MessageId FROM MessageAttrs WHERE AttributeId = ? AND Value = ?" [mboxAttr, sqlMbox]
                    sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length uids) ++ " EXISTS"
                    recent <- countByFlag recentAttr
                    sendResponse ResponseUntagged ResponseStateNone [] $ (show $ length recent) ++ " RECENT"
                    sendResponse ResponseUntagged ResponseStateNone [] "FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\Recent)"
-                   seen <- liftM (sortUids . map head) $ dbQuery "SELECT attr1.MessageId FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1 ORDER BY attr1.MessageId" [mboxAttr, sqlMbox, seenAttr]
+                   seen <- liftM (sortUids . map head) $ dbQuery' "SELECT attr1.MessageId FROM MessageAttrs AS attr1 JOIN MessageAttrs AS attr2 ON attr1.AttributeId = ? AND attr1.Value = ? AND attr1.MessageId = attr2.MessageId WHERE attr2.AttributeId = ? AND attr2.Value = 1 ORDER BY attr1.MessageId" [mboxAttr, sqlMbox, seenAttr]
                    case seen of
                      [] -> return ()
                      (x:_) -> case elemIndex x uids of
                        Nothing -> return ()
                        Just idx -> sendResponse ResponseUntagged ResponseStateNone [] $ "OK [UNSEEN " ++ (show idx) ++ "]"
                    sendResponse ResponseUntagged ResponseStateNone [] "OK [UIDVALIDITY 12345]"
-                   nextUid <- dbQuery "SELECT Val FROM NextMessageId" []
+                   nextUid <- dbQuery' "SELECT Val FROM NextMessageId" []
                    case nextUid of
                      [[DS.SQLInteger i]] ->
                        sendResponse ResponseUntagged ResponseStateNone [] $ "OK [UIDNEXT " ++ (show i) ++ "]"
@@ -341,18 +363,25 @@ processCommand (Right (tag, cmd)) =
                    ImapServer $ \state -> return $ Right (state {iss_messages = map Left uids,
                                                                  iss_selected_mbox = Just $ DT.pack mailbox}, ())
     ImapFetch sequenceNumbers attributes ->
+      loggedIn tag $
       do sequence_ $ map (fetchMessage attributes) sequenceNumbers
          sendResponseOk tag [] "FETCH completed"
     ImapFetchUid uids attributes ->
+      loggedIn tag $
       do sequence_ $ map (fetchMessageUid attributes) uids
          sendResponseOk tag [] "UID FETCH complete"
     ImapStoreUid uids mode silent flags ->
+      loggedIn tag $
       storeUids tag mode silent flags uids
-    ImapExpunge -> do r <- expunge True
-                      if r
-                        then sendResponseOk tag [] "EXPUNGE complete"
-                        else sendResponseBad tag [] "EXPUNGE failed"
-    ImapStatus mbox items -> imapStatus tag mbox items
+    ImapExpunge ->
+      loggedIn tag $      
+      do r <- expunge True
+         if r
+           then sendResponseOk tag [] "EXPUNGE complete"
+           else sendResponseBad tag [] "EXPUNGE failed"
+    ImapStatus mbox items ->
+      loggedIn tag $
+      imapStatus tag mbox items
     ImapClose -> do r <- expunge False
                     if r
                       then do ImapServer $ \state -> return $ Right (state {iss_selected_mbox = Nothing,
@@ -364,6 +393,7 @@ processCommand (Right (tag, cmd)) =
                      sendResponseOk tag [] "LOGOUT"
                      ImapServer $ \_ -> return $ Left ImapStopFinished
     ImapAppend mailbox flags datetime body ->
+      loggedIn tag $
       do valid <- checkValidMbox mailbox
          if not valid
            then sendResponseBad tag [] "APPEND bad mailbox"
@@ -427,7 +457,7 @@ loadMessageByUid uid =
      case cached of
        Just (Right r) -> return r
        _ ->
-         do pathQ <- dbQuery "SELECT Location FROM Messages WHERE MessageId = ?" [uid]
+         do pathQ <- dbQuery' "SELECT Location FROM Messages WHERE MessageId = ?" [uid]
             let path = case pathQ of
                   [[DS.SQLText pth]] -> DT.unpack pth
                   _ -> error $ "Unexpected message path " ++ (show pathQ) ++ " for UID " ++ (show uid)
@@ -507,7 +537,7 @@ fetchSimpleFlag :: String -> Message -> ImapServer Bool
 fetchSimpleFlag flagName eml =
   let uid = msg_uid eml in
   do attrId <- attributeId flagName
-     q <- dbQuery "SELECT Value FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ?"
+     q <- dbQuery' "SELECT Value FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ?"
           [uid, attrId]
      return $
        foldr (\entry acc ->
@@ -530,7 +560,7 @@ clearSimpleFlag flagName eml =
   let uid = msg_uid eml in
   do attrId <- attributeId flagName
      ignore $
-       dbQuery
+       dbQuery'
        "DELETE FROM MessageAttrs WHERE MessageId = ? AND AttributeId = ?"
        [uid, attrId]
        
@@ -539,14 +569,14 @@ setFlag MessageFlagSeen eml =
   let uid = msg_uid eml in
   do attrId <- attributeId "harbinger.seen"
      ignore $
-       dbQuery
+       dbQuery'
        "UPDATE MessageAttrs SET Value = 1 WHERE MessageId = ? AND AttributeId = ?"
        [uid, attrId]
      nrChanges <- ImapServer $ \state ->
        do r <- DS.changes $ iss_database state
           return $ Right (state, r)
      if nrChanges == 0
-       then ignore $ dbQuery "INSERT INTO MessageAttrs (MessageId, AttributeId, Value) VALUES (?, ?, 1)" [uid, attrId]
+       then ignore $ dbQuery' "INSERT INTO MessageAttrs (MessageId, AttributeId, Value) VALUES (?, ?, 1)" [uid, attrId]
        else return ()
 setFlag MessageFlagRecent _ = ImapServer $ \_ -> return $ Left $ ImapStopFailed "Cannot set recent flag"
 setFlag MessageFlagDeleted eml =

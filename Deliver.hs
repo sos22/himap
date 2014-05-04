@@ -61,15 +61,6 @@ flattenEmail :: Email -> BS.ByteString
 flattenEmail eml =
   BS.append (BS.concat $ map flattenHeader (eml_headers eml)) $ BS.append (stringToByteString "\r\n") $ eml_body eml
 
-dbExec :: DS.Database -> String -> [DS.SQLData] -> IO ()
-dbExec database what values =
-  withStatement database (DT.pack what) $ \stmt ->
-  do DS.bind stmt values
-     r <- DS.step stmt
-     case r of
-       DS.Done -> return ()
-       _ -> error $ "dbExec " ++ what ++ " didn't work?"
-     return ()
 addDbRow :: DS.Database -> String -> [DS.SQLData] -> IO ()
 addDbRow database table values =
   dbExec database ("INSERT INTO " ++ table ++ " VALUES (" ++ (intercalate ", " (map (const "?") values)) ++ ")") values

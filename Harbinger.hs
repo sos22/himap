@@ -10,16 +10,6 @@ import Deliver
 import Email
 import Util
 
-runStatement :: DS.Statement -> IO [[DS.SQLData]]
-runStatement s = do r <- DS.step s
-                    case r of
-                      DS.Done -> return []
-                      DS.Row -> (DS.columns s) >>=
-                                (flip liftM (runStatement s) . (:))
-                                
-dbQuery :: DS.Database -> DT.Text -> IO [[DS.SQLData]]                                      
-dbQuery db query = withStatement db query runStatement 
-
 {- Our database schema is a massive abuse.  All of the data gets
 jammed into one table, keyed off of (messageID, attributeID), with a
 single non-key field containing the value of the attribute.  We then
@@ -36,6 +26,7 @@ initialiseDatabase db =
                "CREATE TABLE Messages (MessageId INTEGER PRIMARY KEY NOT NULL, Location TEXT NOT NULL)",
                "CREATE TABLE Attributes (AttributeId INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, Description TEXT NOT NULL)",
                "CREATE TABLE MessageAttrs (MessageId REFERENCES Messages(MessageId) NOT NULL, AttributeId REFERENCES Attributes(AttributeId) NOT NULL, Value NOT NULL)",
+               "CREATE TABLE Users (Username TEXT PRIMARY KEY, PassHash TEXT)",
                "CREATE TABLE MailBoxes (Name STRING UNIQUE)",
                "INSERT INTO MailBoxes (Name) VALUES (\"INBOX\")",
                "CREATE UNIQUE INDEX AttributeRmap ON Attributes (Description)",
@@ -82,7 +73,7 @@ main =
        (\exception -> if DS.sqlError exception == DS.ErrorError
                       then Just ()
                       else Nothing)
-       (do versions <- dbQuery database $ DT.pack "SELECT Version FROM HarbingerVersion"
+       (do versions <- dbQuery database "SELECT Version FROM HarbingerVersion" []
            case versions of
              [] -> error "version table exists but is empty?"
              [[DS.SQLInteger n]] | n > 0 -> return n
