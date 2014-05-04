@@ -170,7 +170,18 @@ storeUids tag mode silent flags uids =
              else return ()
   in do sequence_ $ map doOne uids
         sendResponseOk tag [] "UID STORE complete"
-           
+copyUids :: ResponseTag -> [MsgUid] -> String -> ImapServer ()
+copyUids tag uids mbox =
+  do mbox' <- parseMbox mbox
+     attr <- findAttribute "harbinger.mailbox"
+     case mbox' of
+       Nothing -> sendResponseBad tag [] "Not a valid mbox"
+       Just (MboxLogical _) -> sendResponseBad tag [] "cannot copy to logical mbox"
+       Just (MboxPhysical mbox'') ->
+         let doOne uid =
+               dbQuery' "INSERT INTO MessageAttrs (MessageId, AttributeId, Value) VALUES (?, ?, ?)" [uid, attr, DS.SQLText $ DT.pack mbox'']
+         in do sequence_ $ map doOne uids
+               sendResponseOk tag [] "UID COPY complete"
 expunge :: Bool -> ImapServer Bool
 expunge sendUntagged =
   do msgs <- ImapServer $ \state -> return $ Right (state, iss_messages state)
@@ -441,6 +452,9 @@ processCommand (Right (tag, cmd)) =
     ImapStoreUid uids mode silent flags ->
       loggedIn tag $
       storeUids tag mode silent flags uids
+    ImapCopyUid uids mailbox ->
+      loggedIn tag $
+      copyUids tag uids mailbox
     ImapExpunge ->
       loggedIn tag $      
       do r <- expunge True

@@ -243,6 +243,10 @@ readCommand =
                                                                      trace "C4" $ return r,
                                                                   parseMany1Sep (requireString " ") parseFlag ]
                                             return $ ImapStoreUid uids mode silent flags),
+                          ("UID COPY ", do uids <- parseUidSet
+                                           requireChar ' '
+                                           mbox <- parseMailbox
+                                           return $ ImapCopyUid uids mbox),
                           ("STATUS ", do mbox <- parseMailbox
                                          requireString " ("
                                          flags <- parseMany1Sep (requireString " ") parseStatusItem

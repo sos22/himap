@@ -148,6 +148,7 @@ data ImapCommand = ImapNoop
                  | ImapFetch [MsgSequenceNumber] [FetchAttribute]
                  | ImapFetchUid [MsgUid] [FetchAttribute]
                  | ImapStoreUid [MsgUid] (Maybe Bool) Bool [MessageFlag]
+                 | ImapCopyUid [MsgUid] String
                  | ImapStatus String [StatusItem]
                  | ImapAppend String [MessageFlag] (Maybe String) BS.ByteString
                  | ImapExpunge
