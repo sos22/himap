@@ -438,7 +438,7 @@ processCommand (Right (tag, cmd)) =
                     sendResponse ResponseUntagged ResponseStateNone [] $ "OK [UIDNEXT " ++ (show i) ++ "]"
                   _ -> error $ "NextMessageId query produced unexpected result " ++ (show nextUid)
                 sendResponse ResponseUntagged ResponseStateNone [] "OK [PERMANENTFLAGS ()]"
-                sendResponseOk tag [ResponseAttribute "READ-WRITE"] "SELECT completed"
+                sendResponseOk tag [ResponseAttribute "READ-ONLY"] "SELECT completed"
                 ImapServer $ \state -> return $ Right (state {iss_messages = map Left uids,
                                                               iss_selected_mbox = mbox}, ())
     ImapFetch sequenceNumbers attributes ->
