@@ -502,8 +502,7 @@ parseHeader :: Header -> Either String [(String, DS.SQLData)]
 parseHeader (Header name value) =
   case lookup (map toLower name) parsers of
     Just (fieldname, parser) ->
-      trace ("Parse " ++ name ++ " ---> " ++ (show value)) $
       case runParser parser value of
-        Nothing -> Left $ "cannot parse header " ++ name ++ ", value " ++ (show value)
+        Nothing -> Right []
         Just val -> Right $ [(fieldname, v) | v <- val]
     Nothing -> Right [] {- Not an indexed field -}
