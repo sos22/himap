@@ -68,6 +68,7 @@ loadAttributeTable database =
 main :: IO ()
 main =
   do database <- DS.open $ DT.pack "harbinger.db"
+     DS.exec database $ DT.pack "PRAGMA SYNCHRONOUS = 0;"
      version <-
        catchJust
        (\exception -> if DS.sqlError exception == DS.ErrorError
