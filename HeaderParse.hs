@@ -10,8 +10,12 @@ import qualified Data.ByteString.Lazy as DBL
 import Data.Char
 import Data.List hiding (group)
 import qualified Data.Text as DT
+import Data.Time.Clock.POSIX
+import Data.Time.Format
+import qualified Data.Time.Git as DTG
 import qualified Database.SQLite3 as DS
 import Debug.Trace
+import System.Locale
 
 import Email
 
@@ -30,6 +34,13 @@ instance Monad Parser where
   fstM >>= sndF = Parser $ \state ->
     do (res1, state') <- run_parser fstM state
        run_parser (sndF res1) state'
+  
+everythingElse :: Parser String
+everythingElse = Parser $ \state ->
+  [(ps_rest state, state {ps_consumed = case ps_rest state of
+                             "" -> ps_consumed state
+                             _ -> False,
+                          ps_rest = ""})]
   
 alternatives :: [Parser a] -> Parser a
 alternatives opts = Parser $ \state ->
@@ -460,6 +471,15 @@ referencesParser :: Parser [DS.SQLData]
 referencesParser =
   stripCFWS $ liftM concat $ manySep msgId (stripCFWS $ optional $ char ',')
   
+date :: Parser [DS.SQLData]
+date = do s <- alternatives [quotedString, everythingElse]
+          alternatives [Parser $ \state -> case parseTime defaultTimeLocale rfc822DateFormat s of
+                           Nothing -> []
+                           Just d -> [([DS.SQLInteger $ round $ realToFrac $ utcTimeToPOSIXSeconds d], state)],
+                         Parser $ \state -> case DTG.approxidate s of
+                           Nothing -> []
+                           Just d -> [([DS.SQLInteger $ fromInteger d], state)]]
+            
 -- mapping from RFC822 header name to (attribute name, attribute
 -- parser) pairs.
 parsers :: [(String, (String, Parser [DS.SQLData]))]
@@ -476,7 +496,7 @@ parsers = [("message-id", ("rfc822.Message-Id", msgId)),
            ("comments", ("rfc822.Comments", stringField unstructured)),
            ("keywords", ("rfc822.Keywords",
                          stringField $ many1Sep phrase (stripCFWS $ char ','))),
-           ("date", ("rfc822.Date", stringField $ unstructured))]
+           ("date", ("rfc822.Date", date))]
 
 parseHeader :: Header -> Either String [(String, DS.SQLData)]
 parseHeader (Header name value) =
